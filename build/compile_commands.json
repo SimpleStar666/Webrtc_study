@@ -1,6 +1,12 @@
 [
 {
   "directory": "/workspace/build",
+  "command": "/usr/bin/c++ -DSPDLOG_COMPILED_LIB -I/workspace/src -I/workspace/build/_deps/spdlog-src/include -isystem /usr/include/SDL2 -g -std=gnu++17 -o CMakeFiles/crystal_demo.dir/main_demo.cpp.o -c /workspace/main_demo.cpp",
+  "file": "/workspace/main_demo.cpp",
+  "output": "CMakeFiles/crystal_demo.dir/main_demo.cpp.o"
+},
+{
+  "directory": "/workspace/build",
   "command": "/usr/bin/c++ -DSPDLOG_COMPILED_LIB -I/workspace/src -I/workspace/build/_deps/spdlog-src/include -I/workspace/build/_deps/libdatachannel-src/deps/json/include -g -std=gnu++17 -o CMakeFiles/crystal_signaling_server.dir/main_signaling_server.cpp.o -c /workspace/main_signaling_server.cpp",
   "file": "/workspace/main_signaling_server.cpp",
   "output": "CMakeFiles/crystal_signaling_server.dir/main_signaling_server.cpp.o"
@@ -1645,24 +1651,6 @@
 },
 {
   "directory": "/workspace/build/src",
-  "command": "/usr/bin/c++ -DSPDLOG_COMPILED_LIB -I/workspace/src -I/workspace/build/_deps/spdlog-src/include -I/workspace/build/_deps/libdatachannel-src/deps/json/include -g -std=gnu++17 -o CMakeFiles/crystal_signaling.dir/signaling/signaling_server.cpp.o -c /workspace/src/signaling/signaling_server.cpp",
-  "file": "/workspace/src/signaling/signaling_server.cpp",
-  "output": "src/CMakeFiles/crystal_signaling.dir/signaling/signaling_server.cpp.o"
-},
-{
-  "directory": "/workspace/build/src",
-  "command": "/usr/bin/c++ -DSPDLOG_COMPILED_LIB -I/workspace/src -I/workspace/build/_deps/spdlog-src/include -I/workspace/build/_deps/libdatachannel-src/deps/json/include -g -std=gnu++17 -o CMakeFiles/crystal_signaling.dir/signaling/signaling_client.cpp.o -c /workspace/src/signaling/signaling_client.cpp",
-  "file": "/workspace/src/signaling/signaling_client.cpp",
-  "output": "src/CMakeFiles/crystal_signaling.dir/signaling/signaling_client.cpp.o"
-},
-{
-  "directory": "/workspace/build/src",
-  "command": "/usr/bin/c++ -DRTC_ENABLE_MEDIA=1 -DRTC_ENABLE_WEBSOCKET=1 -DSPDLOG_COMPILED_LIB -I/workspace/src -I/workspace/build/_deps/spdlog-src/include -I/workspace/build/_deps/libdatachannel-src/include -g -std=gnu++17 -o CMakeFiles/crystal_transport.dir/transport/transport_manager.cpp.o -c /workspace/src/transport/transport_manager.cpp",
-  "file": "/workspace/src/transport/transport_manager.cpp",
-  "output": "src/CMakeFiles/crystal_transport.dir/transport/transport_manager.cpp.o"
-},
-{
-  "directory": "/workspace/build/src",
   "command": "/usr/bin/c++ -DSPDLOG_COMPILED_LIB -I/workspace/src -I/workspace/build/_deps/spdlog-src/include -g -std=gnu++17 -o CMakeFiles/crystal_media_rtp.dir/media/rtp/rtp_packet.cpp.o -c /workspace/src/media/rtp/rtp_packet.cpp",
   "file": "/workspace/src/media/rtp/rtp_packet.cpp",
   "output": "src/CMakeFiles/crystal_media_rtp.dir/media/rtp/rtp_packet.cpp.o"
@@ -1708,6 +1696,24 @@
   "command": "/usr/bin/c++ -DSPDLOG_COMPILED_LIB -I/workspace/src -I/workspace/build/_deps/spdlog-src/include -isystem /usr/include/SDL2 -g -std=gnu++17 -o CMakeFiles/crystal_media_video.dir/media/video/sdl_renderer.cpp.o -c /workspace/src/media/video/sdl_renderer.cpp",
   "file": "/workspace/src/media/video/sdl_renderer.cpp",
   "output": "src/CMakeFiles/crystal_media_video.dir/media/video/sdl_renderer.cpp.o"
+},
+{
+  "directory": "/workspace/build/src",
+  "command": "/usr/bin/c++ -DSPDLOG_COMPILED_LIB -I/workspace/src -I/workspace/build/_deps/spdlog-src/include -I/workspace/build/_deps/libdatachannel-src/deps/json/include -g -std=gnu++17 -o CMakeFiles/crystal_signaling.dir/signaling/signaling_server.cpp.o -c /workspace/src/signaling/signaling_server.cpp",
+  "file": "/workspace/src/signaling/signaling_server.cpp",
+  "output": "src/CMakeFiles/crystal_signaling.dir/signaling/signaling_server.cpp.o"
+},
+{
+  "directory": "/workspace/build/src",
+  "command": "/usr/bin/c++ -DSPDLOG_COMPILED_LIB -I/workspace/src -I/workspace/build/_deps/spdlog-src/include -I/workspace/build/_deps/libdatachannel-src/deps/json/include -g -std=gnu++17 -o CMakeFiles/crystal_signaling.dir/signaling/signaling_client.cpp.o -c /workspace/src/signaling/signaling_client.cpp",
+  "file": "/workspace/src/signaling/signaling_client.cpp",
+  "output": "src/CMakeFiles/crystal_signaling.dir/signaling/signaling_client.cpp.o"
+},
+{
+  "directory": "/workspace/build/src",
+  "command": "/usr/bin/c++ -DRTC_ENABLE_MEDIA=1 -DRTC_ENABLE_WEBSOCKET=1 -DSPDLOG_COMPILED_LIB -I/workspace/src -I/workspace/build/_deps/spdlog-src/include -I/workspace/build/_deps/libdatachannel-src/include -g -std=gnu++17 -o CMakeFiles/crystal_transport.dir/transport/transport_manager.cpp.o -c /workspace/src/transport/transport_manager.cpp",
+  "file": "/workspace/src/transport/transport_manager.cpp",
+  "output": "src/CMakeFiles/crystal_transport.dir/transport/transport_manager.cpp.o"
 },
 {
   "directory": "/workspace/build/src",

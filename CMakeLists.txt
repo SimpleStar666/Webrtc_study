@@ -38,6 +38,15 @@ add_subdirectory(src)
 enable_testing()
 add_subdirectory(tests)
 
+add_executable(crystal_demo main_demo.cpp)
+target_link_libraries(crystal_demo PRIVATE
+    -Wl,--whole-archive
+    crystal_media_video crystal_media_rtp crystal_utils
+    -Wl,--no-whole-archive
+    spdlog::spdlog
+    avcodec swresample swscale avutil
+)
+
 add_executable(crystal_signaling_server main_signaling_server.cpp)
 target_link_libraries(crystal_signaling_server PRIVATE crystal_signaling crystal_utils websockets)
 

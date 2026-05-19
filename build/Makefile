@@ -172,6 +172,19 @@ depend:
 .PHONY : depend
 
 #=============================================================================
+# Target rules for targets named crystal_demo
+
+# Build rule for target.
+crystal_demo: cmake_check_build_system
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 crystal_demo
+.PHONY : crystal_demo
+
+# fast build rule for target.
+crystal_demo/fast:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/crystal_demo.dir/build.make CMakeFiles/crystal_demo.dir/build
+.PHONY : crystal_demo/fast
+
+#=============================================================================
 # Target rules for targets named crystal_signaling_server
 
 # Build rule for target.
@@ -754,6 +767,30 @@ main_client.cpp.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/crystal_client.dir/build.make CMakeFiles/crystal_client.dir/main_client.cpp.s
 .PHONY : main_client.cpp.s
 
+main_demo.o: main_demo.cpp.o
+.PHONY : main_demo.o
+
+# target to build an object file
+main_demo.cpp.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/crystal_demo.dir/build.make CMakeFiles/crystal_demo.dir/main_demo.cpp.o
+.PHONY : main_demo.cpp.o
+
+main_demo.i: main_demo.cpp.i
+.PHONY : main_demo.i
+
+# target to preprocess a source file
+main_demo.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/crystal_demo.dir/build.make CMakeFiles/crystal_demo.dir/main_demo.cpp.i
+.PHONY : main_demo.cpp.i
+
+main_demo.s: main_demo.cpp.s
+.PHONY : main_demo.s
+
+# target to generate assembly for a file
+main_demo.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/crystal_demo.dir/build.make CMakeFiles/crystal_demo.dir/main_demo.cpp.s
+.PHONY : main_demo.cpp.s
+
 main_signaling_server.o: main_signaling_server.cpp.o
 .PHONY : main_signaling_server.o
 
@@ -793,6 +830,7 @@ help:
 	@echo "... test"
 	@echo "... cipher_driver"
 	@echo "... crystal_client"
+	@echo "... crystal_demo"
 	@echo "... crystal_media_audio"
 	@echo "... crystal_media_rtp"
 	@echo "... crystal_media_video"
@@ -837,6 +875,9 @@ help:
 	@echo "... main_client.o"
 	@echo "... main_client.i"
 	@echo "... main_client.s"
+	@echo "... main_demo.o"
+	@echo "... main_demo.i"
+	@echo "... main_demo.s"
 	@echo "... main_signaling_server.o"
 	@echo "... main_signaling_server.i"
 	@echo "... main_signaling_server.s"

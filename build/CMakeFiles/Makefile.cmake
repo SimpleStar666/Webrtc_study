@@ -240,6 +240,7 @@ set(CMAKE_MAKEFILE_PRODUCTS
 
 # Dependency information for all targets:
 set(CMAKE_DEPEND_INFO_FILES
+  "CMakeFiles/crystal_demo.dir/DependInfo.cmake"
   "CMakeFiles/crystal_signaling_server.dir/DependInfo.cmake"
   "CMakeFiles/crystal_client.dir/DependInfo.cmake"
   "_deps/spdlog-build/CMakeFiles/spdlog.dir/DependInfo.cmake"

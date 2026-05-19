@@ -1,3 +1,4 @@
+/workspace/build/CMakeFiles/crystal_demo.dir
 /workspace/build/CMakeFiles/crystal_signaling_server.dir
 /workspace/build/CMakeFiles/crystal_client.dir
 /workspace/build/CMakeFiles/test.dir
