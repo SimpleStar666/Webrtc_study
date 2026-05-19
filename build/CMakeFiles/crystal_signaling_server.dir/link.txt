@@ -1,0 +1,1 @@
+/usr/bin/c++ -g CMakeFiles/crystal_signaling_server.dir/main_signaling_server.cpp.o -o crystal_signaling_server  src/libcrystal_signaling.a src/libcrystal_utils.a -lwebsockets _deps/spdlog-build/libspdlogd.a 

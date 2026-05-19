@@ -1,0 +1,2 @@
+/usr/bin/ar qc libcrystal_media_audio.a CMakeFiles/crystal_media_audio.dir/media/audio/alsa_capture.cpp.o CMakeFiles/crystal_media_audio.dir/media/audio/opus_encoder.cpp.o CMakeFiles/crystal_media_audio.dir/media/audio/opus_decoder.cpp.o CMakeFiles/crystal_media_audio.dir/media/audio/sdl_audio_player.cpp.o
+/usr/bin/ranlib libcrystal_media_audio.a

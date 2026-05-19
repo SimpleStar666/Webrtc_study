@@ -1,0 +1,3 @@
+/workspace/build/_deps/libdatachannel-subbuild/CMakeFiles/libdatachannel-populate.dir
+/workspace/build/_deps/libdatachannel-subbuild/CMakeFiles/edit_cache.dir
+/workspace/build/_deps/libdatachannel-subbuild/CMakeFiles/rebuild_cache.dir

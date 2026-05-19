@@ -1,0 +1,24 @@
+{
+    "signaling": {
+        "host": "0.0.0.0",
+        "port": 8765
+    },
+    "ice": {
+        "stun_servers": ["stun:stun.l.google.com:19302"],
+        "turn_servers": []
+    },
+    "video": {
+        "width": 640,
+        "height": 480,
+        "fps": 30,
+        "bitrate_kbps": 1000,
+        "codec": "h264"
+    },
+    "audio": {
+        "sample_rate": 48000,
+        "channels": 1,
+        "bitrate_kbps": 64,
+        "codec": "opus",
+        "frame_size": 960
+    }
+}
