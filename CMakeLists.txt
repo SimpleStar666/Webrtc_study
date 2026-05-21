@@ -25,8 +25,8 @@ FetchContent_Declare(
 set(BUILD_TESTING ON)
 FetchContent_MakeAvailable(spdlog googletest libdatachannel)
 
-find_package(SDL2 REQUIRED)
 find_package(PkgConfig REQUIRED)
+pkg_check_modules(SDL2 REQUIRED sdl2)
 pkg_check_modules(AVCODEC REQUIRED libavcodec)
 pkg_check_modules(AVUTIL REQUIRED libavutil)
 pkg_check_modules(SWSCALE REQUIRED libswscale)
@@ -58,7 +58,9 @@ target_link_libraries(crystal_client PRIVATE
     crystal_media_rtp crystal_room crystal_utils
     -Wl,--no-whole-archive
     datachannel websockets spdlog::spdlog nlohmann_json::nlohmann_json
-    SDL2::SDL2
+    ${SDL2_LIBRARIES}
     avcodec swresample swscale avutil
     opus asound
 )
+target_include_directories(crystal_client PRIVATE ${SDL2_INCLUDE_DIRS})
+target_link_directories(crystal_client PRIVATE ${SDL2_LIBRARY_DIRS})
