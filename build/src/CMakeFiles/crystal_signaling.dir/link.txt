@@ -1,2 +1,0 @@
-/usr/bin/ar qc libcrystal_signaling.a CMakeFiles/crystal_signaling.dir/signaling/signaling_server.cpp.o CMakeFiles/crystal_signaling.dir/signaling/signaling_client.cpp.o
-/usr/bin/ranlib libcrystal_signaling.a

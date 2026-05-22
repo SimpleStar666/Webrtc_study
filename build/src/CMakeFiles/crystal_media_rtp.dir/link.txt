@@ -1,2 +1,0 @@
-/usr/bin/ar qc libcrystal_media_rtp.a CMakeFiles/crystal_media_rtp.dir/media/rtp/rtp_packet.cpp.o CMakeFiles/crystal_media_rtp.dir/media/rtp/rtp_packetizer.cpp.o CMakeFiles/crystal_media_rtp.dir/media/rtp/rtp_depacketizer.cpp.o CMakeFiles/crystal_media_rtp.dir/media/rtp/jitter_buffer.cpp.o
-/usr/bin/ranlib libcrystal_media_rtp.a
