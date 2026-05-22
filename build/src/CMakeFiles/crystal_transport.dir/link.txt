@@ -1,0 +1,2 @@
+/usr/bin/ar qc libcrystal_transport.a CMakeFiles/crystal_transport.dir/transport/transport_manager.cpp.o
+/usr/bin/ranlib libcrystal_transport.a
