@@ -6,5 +6,5 @@ CXX_DEFINES = -DSPDLOG_COMPILED_LIB
 
 CXX_INCLUDES = -I/workspace/src -I/workspace/build/_deps/spdlog-src/include -isystem /workspace/build/_deps/googletest-src/googletest/include -isystem /workspace/build/_deps/googletest-src/googletest
 
-CXX_FLAGS = -g -std=gnu++17
+CXX_FLAGS = -O3 -DNDEBUG -std=gnu++17
 

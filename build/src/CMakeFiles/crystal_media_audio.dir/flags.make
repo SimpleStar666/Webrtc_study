@@ -4,7 +4,7 @@
 # compile CXX with /usr/bin/c++
 CXX_DEFINES = -DSPDLOG_COMPILED_LIB
 
-CXX_INCLUDES = -I/workspace/src -I/usr/include/opus -I/workspace/build/_deps/spdlog-src/include -isystem /usr/include/SDL2
+CXX_INCLUDES = -I/workspace/src -I/usr/include/opus -I/usr/include/SDL2 -I/workspace/build/_deps/spdlog-src/include
 
-CXX_FLAGS = -g -std=gnu++17
+CXX_FLAGS = -O3 -DNDEBUG -std=gnu++17
 

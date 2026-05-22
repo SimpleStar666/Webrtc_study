@@ -6,5 +6,5 @@ C_DEFINES = -DRTC_ENABLE_MEDIA=1 -DRTC_ENABLE_WEBSOCKET=1
 
 C_INCLUDES = -I/workspace/build/_deps/libdatachannel-src/include
 
-C_FLAGS = -g -std=gnu11 -fPIE
+C_FLAGS = -O3 -DNDEBUG -std=gnu11 -fPIE
 

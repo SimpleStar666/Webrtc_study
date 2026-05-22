@@ -1,15 +1,15 @@
 #----------------------------------------------------------------
-# Generated CMake target import file for configuration "Debug".
+# Generated CMake target import file for configuration "Release".
 #----------------------------------------------------------------
 
 # Commands may need to know the format version.
 set(CMAKE_IMPORT_FILE_VERSION 1)
 
-# Import target "LibJuice::LibJuice" for configuration "Debug"
-set_property(TARGET LibJuice::LibJuice APPEND PROPERTY IMPORTED_CONFIGURATIONS DEBUG)
+# Import target "LibJuice::LibJuice" for configuration "Release"
+set_property(TARGET LibJuice::LibJuice APPEND PROPERTY IMPORTED_CONFIGURATIONS RELEASE)
 set_target_properties(LibJuice::LibJuice PROPERTIES
-  IMPORTED_LOCATION_DEBUG "${_IMPORT_PREFIX}/lib/libjuice.so.1.4.2"
-  IMPORTED_SONAME_DEBUG "libjuice.so.1.4.2"
+  IMPORTED_LOCATION_RELEASE "${_IMPORT_PREFIX}/lib/libjuice.so.1.4.2"
+  IMPORTED_SONAME_RELEASE "libjuice.so.1.4.2"
   )
 
 list(APPEND _cmake_import_check_targets LibJuice::LibJuice )

@@ -6,5 +6,5 @@ C_DEFINES = -DHAVE_CONFIG_H
 
 C_INCLUDES = -I/workspace/build/_deps/libdatachannel-build/deps/libsrtp -I/workspace/build/_deps/libdatachannel-src/deps/libsrtp/test -I/workspace/build/_deps/libdatachannel-src/deps/libsrtp/crypto/include -I/workspace/build/_deps/libdatachannel-src/deps/libsrtp/include
 
-C_FLAGS = -g -fPIE
+C_FLAGS = -O3 -DNDEBUG -fPIE
 

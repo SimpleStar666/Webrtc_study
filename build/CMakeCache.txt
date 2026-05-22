@@ -38,9 +38,8 @@ CMAKE_ADDR2LINE:FILEPATH=/usr/bin/addr2line
 //Path to a program.
 CMAKE_AR:FILEPATH=/usr/bin/ar
 
-//Choose the type of build, options are: None Debug Release RelWithDebInfo
-// MinSizeRel ...
-CMAKE_BUILD_TYPE:STRING=Debug
+//Choose Release or Debug
+CMAKE_BUILD_TYPE:STRING=Release
 
 //Enable/Disable color output during build.
 CMAKE_COLOR_MAKEFILE:BOOL=ON
@@ -467,9 +466,6 @@ SCTP_DEBUG:BOOL=OFF
 //Build with mbedtls sha1 support.
 SCTP_USE_MBEDTLS_SHA1:BOOL=OFF
 
-//The directory containing a CMake configuration file for SDL2.
-SDL2_DIR:PATH=/usr/lib/x86_64-linux-gnu/cmake/SDL2
-
 //Build all artifacts
 SPDLOG_BUILD_ALL:BOOL=OFF
 
@@ -693,6 +689,9 @@ pkgcfg_lib_AVUTIL_avutil:FILEPATH=/usr/lib/x86_64-linux-gnu/libavutil.so
 
 //Path to a library.
 pkgcfg_lib_OPUS_opus:FILEPATH=/usr/lib/x86_64-linux-gnu/libopus.so
+
+//Path to a library.
+pkgcfg_lib_SDL2_SDL2:FILEPATH=/usr/lib/x86_64-linux-gnu/libSDL2.so
 
 //Path to a library.
 pkgcfg_lib_SWSCALE_swscale:FILEPATH=/usr/lib/x86_64-linux-gnu/libswscale.so
@@ -1161,6 +1160,41 @@ OPUS_opus_VERSION:INTERNAL=
 PKG_CONFIG_ARGN-ADVANCED:INTERNAL=1
 //ADVANCED property for variable: PKG_CONFIG_EXECUTABLE
 PKG_CONFIG_EXECUTABLE-ADVANCED:INTERNAL=1
+SDL2_CFLAGS:INTERNAL=-I/usr/include;-I/usr/include/SDL2;-D_REENTRANT
+SDL2_CFLAGS_I:INTERNAL=
+SDL2_CFLAGS_OTHER:INTERNAL=-D_REENTRANT
+SDL2_FOUND:INTERNAL=1
+SDL2_INCLUDEDIR:INTERNAL=/usr/include
+SDL2_INCLUDE_DIRS:INTERNAL=/usr/include;/usr/include/SDL2
+SDL2_LDFLAGS:INTERNAL=-L/usr/lib/x86_64-linux-gnu;-lSDL2
+SDL2_LDFLAGS_OTHER:INTERNAL=
+SDL2_LIBDIR:INTERNAL=/usr/lib/x86_64-linux-gnu
+SDL2_LIBRARIES:INTERNAL=SDL2
+SDL2_LIBRARY_DIRS:INTERNAL=/usr/lib/x86_64-linux-gnu
+SDL2_LIBS:INTERNAL=
+SDL2_LIBS_L:INTERNAL=
+SDL2_LIBS_OTHER:INTERNAL=
+SDL2_LIBS_PATHS:INTERNAL=
+SDL2_MODULE_NAME:INTERNAL=sdl2
+SDL2_PREFIX:INTERNAL=/usr
+SDL2_STATIC_CFLAGS:INTERNAL=-I/usr/include;-I/usr/include/SDL2;-D_REENTRANT
+SDL2_STATIC_CFLAGS_I:INTERNAL=
+SDL2_STATIC_CFLAGS_OTHER:INTERNAL=-D_REENTRANT
+SDL2_STATIC_INCLUDE_DIRS:INTERNAL=/usr/include;/usr/include/SDL2
+SDL2_STATIC_LDFLAGS:INTERNAL=-L/usr/lib/x86_64-linux-gnu;-lSDL2;-lm;-lasound;-lm;-ldl;-lpthread;-lpulse;-pthread;-lsamplerate;-lX11;-lXext;-lXcursor;-lXi;-lXfixes;-lXrandr;-lXss;-ldrm;-lgbm;-lwayland-egl;-lwayland-client;-lwayland-cursor;-lxkbcommon;-ldecor-0;-lpthread
+SDL2_STATIC_LDFLAGS_OTHER:INTERNAL=-pthread
+SDL2_STATIC_LIBDIR:INTERNAL=
+SDL2_STATIC_LIBRARIES:INTERNAL=SDL2;m;asound;m;dl;pthread;pulse;samplerate;X11;Xext;Xcursor;Xi;Xfixes;Xrandr;Xss;drm;gbm;wayland-egl;wayland-client;wayland-cursor;xkbcommon;decor-0;pthread
+SDL2_STATIC_LIBRARY_DIRS:INTERNAL=/usr/lib/x86_64-linux-gnu
+SDL2_STATIC_LIBS:INTERNAL=
+SDL2_STATIC_LIBS_L:INTERNAL=
+SDL2_STATIC_LIBS_OTHER:INTERNAL=
+SDL2_STATIC_LIBS_PATHS:INTERNAL=
+SDL2_VERSION:INTERNAL=2.30.0
+SDL2_sdl2_INCLUDEDIR:INTERNAL=
+SDL2_sdl2_LIBDIR:INTERNAL=
+SDL2_sdl2_PREFIX:INTERNAL=
+SDL2_sdl2_VERSION:INTERNAL=
 //CHECK_TYPE_SIZE: sizeof(unsigned long)
 SIZEOF_UNSIGNED_LONG:INTERNAL=8
 //CHECK_TYPE_SIZE: sizeof(unsigned long long)
@@ -1262,12 +1296,14 @@ __pkg_config_arguments_ALSA:INTERNAL=REQUIRED;alsa
 __pkg_config_arguments_AVCODEC:INTERNAL=REQUIRED;libavcodec
 __pkg_config_arguments_AVUTIL:INTERNAL=REQUIRED;libavutil
 __pkg_config_arguments_OPUS:INTERNAL=REQUIRED;opus
+__pkg_config_arguments_SDL2:INTERNAL=REQUIRED;sdl2
 __pkg_config_arguments_SWSCALE:INTERNAL=REQUIRED;libswscale
 __pkg_config_arguments__OPENSSL:INTERNAL=QUIET;openssl
 __pkg_config_checked_ALSA:INTERNAL=1
 __pkg_config_checked_AVCODEC:INTERNAL=1
 __pkg_config_checked_AVUTIL:INTERNAL=1
 __pkg_config_checked_OPUS:INTERNAL=1
+__pkg_config_checked_SDL2:INTERNAL=1
 __pkg_config_checked_SWSCALE:INTERNAL=1
 __pkg_config_checked__OPENSSL:INTERNAL=1
 cmake_package_name:INTERNAL=GTest
@@ -1336,6 +1372,8 @@ pkgcfg_lib_AVCODEC_avcodec-ADVANCED:INTERNAL=1
 pkgcfg_lib_AVUTIL_avutil-ADVANCED:INTERNAL=1
 //ADVANCED property for variable: pkgcfg_lib_OPUS_opus
 pkgcfg_lib_OPUS_opus-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: pkgcfg_lib_SDL2_SDL2
+pkgcfg_lib_SDL2_SDL2-ADVANCED:INTERNAL=1
 //ADVANCED property for variable: pkgcfg_lib_SWSCALE_swscale
 pkgcfg_lib_SWSCALE_swscale-ADVANCED:INTERNAL=1
 //ADVANCED property for variable: pkgcfg_lib__OPENSSL_crypto

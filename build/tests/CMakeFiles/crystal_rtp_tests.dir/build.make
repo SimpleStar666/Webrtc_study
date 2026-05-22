@@ -143,7 +143,7 @@ tests/crystal_rtp_tests: tests/CMakeFiles/crystal_rtp_tests.dir/build.make
 tests/crystal_rtp_tests: src/libcrystal_media_rtp.a
 tests/crystal_rtp_tests: src/libcrystal_utils.a
 tests/crystal_rtp_tests: lib/libgtest_main.a
-tests/crystal_rtp_tests: _deps/spdlog-build/libspdlogd.a
+tests/crystal_rtp_tests: _deps/spdlog-build/libspdlog.a
 tests/crystal_rtp_tests: lib/libgtest.a
 tests/crystal_rtp_tests: tests/CMakeFiles/crystal_rtp_tests.dir/link.txt
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --bold --progress-dir=/workspace/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_5) "Linking CXX executable crystal_rtp_tests"

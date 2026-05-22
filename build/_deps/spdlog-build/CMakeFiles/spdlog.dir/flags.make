@@ -6,5 +6,5 @@ CXX_DEFINES = -DSPDLOG_COMPILED_LIB
 
 CXX_INCLUDES = -I/workspace/build/_deps/spdlog-src/include
 
-CXX_FLAGS = -g -std=c++17
+CXX_FLAGS = -O3 -DNDEBUG -std=c++17
 

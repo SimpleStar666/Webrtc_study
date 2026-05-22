@@ -95,8 +95,7 @@ crystal_demo: CMakeFiles/crystal_demo.dir/build.make
 crystal_demo: src/libcrystal_media_video.a
 crystal_demo: src/libcrystal_media_rtp.a
 crystal_demo: src/libcrystal_utils.a
-crystal_demo: _deps/spdlog-build/libspdlogd.a
-crystal_demo: /usr/lib/x86_64-linux-gnu/libSDL2.so
+crystal_demo: _deps/spdlog-build/libspdlog.a
 crystal_demo: CMakeFiles/crystal_demo.dir/link.txt
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --bold --progress-dir=/workspace/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_2) "Linking CXX executable crystal_demo"
 	$(CMAKE_COMMAND) -E cmake_link_script CMakeFiles/crystal_demo.dir/link.txt --verbose=$(VERBOSE)

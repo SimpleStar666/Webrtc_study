@@ -6,5 +6,5 @@ C_DEFINES =
 
 C_INCLUDES = -I/workspace/build/_deps/libdatachannel-src/deps/libjuice/src -I/workspace/build/_deps/libdatachannel-src/deps/libjuice/include/juice -I/workspace/build/_deps/libdatachannel-src/deps/libjuice/include
 
-C_FLAGS = -g -std=gnu11 -fPIE
+C_FLAGS = -O3 -DNDEBUG -std=gnu11 -fPIE
 

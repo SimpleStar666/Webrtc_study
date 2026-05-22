@@ -6,5 +6,5 @@ CXX_DEFINES = -DJUICE_STATIC -DRTC_ENABLE_MEDIA=1 -DRTC_ENABLE_WEBSOCKET=1 -DRTC
 
 CXX_INCLUDES = -I/workspace/build/_deps/libdatachannel-src/include -I/workspace/build/_deps/libdatachannel-src/include/rtc -I/workspace/build/_deps/libdatachannel-src/src -I/workspace/build/_deps/libdatachannel-src/deps/usrsctp/usrsctplib -I/workspace/build/_deps/libdatachannel-src/deps/plog/include -I/workspace/build/_deps/libdatachannel-src/deps/libsrtp/crypto/include -I/workspace/build/_deps/libdatachannel-src/deps/libsrtp/include -I/workspace/build/_deps/libdatachannel-src/deps/libjuice/include
 
-CXX_FLAGS = -g -std=gnu++17 -fPIC -fvisibility=default -Wall -Wextra
+CXX_FLAGS = -O3 -DNDEBUG -std=gnu++17 -fPIC -fvisibility=default -Wall -Wextra
 

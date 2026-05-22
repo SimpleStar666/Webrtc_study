@@ -6,5 +6,5 @@ CXX_DEFINES = -DBENCHMARK_MAIN=1 -DRTC_ENABLE_MEDIA=1 -DRTC_ENABLE_WEBSOCKET=1
 
 CXX_INCLUDES = -I/workspace/build/_deps/libdatachannel-src/src -I/workspace/build/_deps/libdatachannel-src/include
 
-CXX_FLAGS = -g -std=gnu++17 -fPIE
+CXX_FLAGS = -O3 -DNDEBUG -std=gnu++17 -fPIE
 

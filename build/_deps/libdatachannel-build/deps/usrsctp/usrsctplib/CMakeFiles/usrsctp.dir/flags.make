@@ -6,5 +6,5 @@ C_DEFINES = -DHAVE_LINUX_IF_ADDR_H -DHAVE_LINUX_RTNETLINK_H -DHAVE_NETINET_IP_IC
 
 C_INCLUDES = -I/workspace/build/_deps/libdatachannel-src/deps/usrsctp/usrsctplib
 
-C_FLAGS =  -std=c99 -pedantic -Wall -Wextra -Wfloat-equal -Wshadow -Wpointer-arith -Wunreachable-code -Winit-self -Wno-unused-function -Wno-unused-parameter -Wno-unreachable-code -Wstrict-prototypes -Wno-address-of-packed-member -Wno-deprecated-declarations -g -fPIC
+C_FLAGS =  -std=c99 -pedantic -Wall -Wextra -Wfloat-equal -Wshadow -Wpointer-arith -Wunreachable-code -Winit-self -Wno-unused-function -Wno-unused-parameter -Wno-unreachable-code -Wstrict-prototypes -Wno-address-of-packed-member -Wno-deprecated-declarations -O3 -DNDEBUG -fPIC
 

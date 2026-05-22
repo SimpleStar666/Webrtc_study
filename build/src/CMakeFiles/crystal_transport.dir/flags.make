@@ -6,5 +6,5 @@ CXX_DEFINES = -DRTC_ENABLE_MEDIA=1 -DRTC_ENABLE_WEBSOCKET=1 -DSPDLOG_COMPILED_LI
 
 CXX_INCLUDES = -I/workspace/src -I/workspace/build/_deps/spdlog-src/include -I/workspace/build/_deps/libdatachannel-src/include
 
-CXX_FLAGS = -g -std=gnu++17
+CXX_FLAGS = -O3 -DNDEBUG -std=gnu++17
 

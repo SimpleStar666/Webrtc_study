@@ -99,7 +99,7 @@ crystal_client: src/libcrystal_media_audio.a
 crystal_client: src/libcrystal_media_rtp.a
 crystal_client: src/libcrystal_room.a
 crystal_client: src/libcrystal_utils.a
-crystal_client: _deps/spdlog-build/libspdlogd.a
+crystal_client: _deps/spdlog-build/libspdlog.a
 crystal_client: CMakeFiles/crystal_client.dir/link.txt
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --bold --progress-dir=/workspace/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_2) "Linking CXX executable crystal_client"
 	$(CMAKE_COMMAND) -E cmake_link_script CMakeFiles/crystal_client.dir/link.txt --verbose=$(VERBOSE)
