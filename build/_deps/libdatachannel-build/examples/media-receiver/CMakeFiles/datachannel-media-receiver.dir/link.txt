@@ -1,0 +1,1 @@
+/usr/bin/c++ -O3 -DNDEBUG "CMakeFiles/datachannel-media-receiver.dir/main.cpp.o" -o media-receiver  -Wl,-rpath,/workspace/build/_deps/libdatachannel-build ../../libdatachannel.so.0.21.2 

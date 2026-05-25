@@ -1,0 +1,1 @@
+/usr/bin/c++ -O3 -DNDEBUG CMakeFiles/crystal_demo.dir/main_demo.cpp.o -o crystal_demo  -Wl,--whole-archive src/libcrystal_media_video.a src/libcrystal_media_rtp.a src/libcrystal_utils.a -Wl,--no-whole-archive _deps/spdlog-build/libspdlog.a -lavcodec -lswresample -lswscale -lavutil -lSDL2 

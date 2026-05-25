@@ -1,0 +1,1 @@
+/usr/bin/cc -O3 -DNDEBUG CMakeFiles/test_srtp.dir/test/test_srtp.c.o -o test_srtp  libsrtp2.a /usr/lib/x86_64-linux-gnu/libcrypto.so 

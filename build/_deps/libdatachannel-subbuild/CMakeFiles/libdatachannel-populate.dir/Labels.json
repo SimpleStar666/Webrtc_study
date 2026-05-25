@@ -1,0 +1,46 @@
+{
+	"sources" : 
+	[
+		{
+			"file" : "/workspace/build/_deps/libdatachannel-subbuild/CMakeFiles/libdatachannel-populate"
+		},
+		{
+			"file" : "/workspace/build/_deps/libdatachannel-subbuild/CMakeFiles/libdatachannel-populate.rule"
+		},
+		{
+			"file" : "/workspace/build/_deps/libdatachannel-subbuild/CMakeFiles/libdatachannel-populate-complete.rule"
+		},
+		{
+			"file" : "/workspace/build/_deps/libdatachannel-subbuild/libdatachannel-populate-prefix/src/libdatachannel-populate-stamp/libdatachannel-populate-build.rule"
+		},
+		{
+			"file" : "/workspace/build/_deps/libdatachannel-subbuild/libdatachannel-populate-prefix/src/libdatachannel-populate-stamp/libdatachannel-populate-configure.rule"
+		},
+		{
+			"file" : "/workspace/build/_deps/libdatachannel-subbuild/libdatachannel-populate-prefix/src/libdatachannel-populate-stamp/libdatachannel-populate-download.rule"
+		},
+		{
+			"file" : "/workspace/build/_deps/libdatachannel-subbuild/libdatachannel-populate-prefix/src/libdatachannel-populate-stamp/libdatachannel-populate-install.rule"
+		},
+		{
+			"file" : "/workspace/build/_deps/libdatachannel-subbuild/libdatachannel-populate-prefix/src/libdatachannel-populate-stamp/libdatachannel-populate-mkdir.rule"
+		},
+		{
+			"file" : "/workspace/build/_deps/libdatachannel-subbuild/libdatachannel-populate-prefix/src/libdatachannel-populate-stamp/libdatachannel-populate-patch.rule"
+		},
+		{
+			"file" : "/workspace/build/_deps/libdatachannel-subbuild/libdatachannel-populate-prefix/src/libdatachannel-populate-stamp/libdatachannel-populate-test.rule"
+		},
+		{
+			"file" : "/workspace/build/_deps/libdatachannel-subbuild/libdatachannel-populate-prefix/src/libdatachannel-populate-stamp/libdatachannel-populate-update.rule"
+		}
+	],
+	"target" : 
+	{
+		"labels" : 
+		[
+			"libdatachannel-populate"
+		],
+		"name" : "libdatachannel-populate"
+	}
+}

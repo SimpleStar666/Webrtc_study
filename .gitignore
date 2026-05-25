@@ -1,8 +1,0 @@
-build/
-*.o
-*.a
-*.so
-*.out
-*.d
-.cache/
-compile_commands.json

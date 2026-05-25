@@ -1,0 +1,1 @@
+/usr/bin/cc -O3 -DNDEBUG "CMakeFiles/datachannel-copy-paste-capi-offerer.dir/offerer.c.o" -o offerer  -Wl,-rpath,/workspace/build/_deps/libdatachannel-build ../../libdatachannel.so.0.21.2 
