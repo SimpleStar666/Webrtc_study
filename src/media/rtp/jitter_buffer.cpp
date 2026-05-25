@@ -19,20 +19,22 @@
 //     - 值 0~32767 表示 seq >= expectedSeq（正常递增或相等）
 //     - 值 32768~65535（即 int16_t 的 -32768~-1）表示 seq < expectedSeq（乱序/重复）
 //
-// 示例：
-//   expectedSeq=100, seq=102 → diff=2   （正常，跳了2个包）
-//   expectedSeq=65535, seq=0 → diff=1   （回绕，正常递增）
-//   expectedSeq=65535, seq=2 → diff=3   （回绕，跳了3个包）
-//   expectedSeq=100, seq=99  → diff=-1  （乱序，迟到的包）
-//   expectedSeq=0, seq=65534 → diff=-2  （回绕方向的乱序）
+// 示例（expectedSeq_ 代表"下一个期望收到的序列号"）：
+//   expectedSeq=101, seq=101 → diff=0   （收到期望的包，正常）
+//   expectedSeq=101, seq=102 → diff=1   （跳了1个包，seq 101 丢失）
+//   expectedSeq=101, seq=103 → diff=2   （跳了2个包，seq 101,102 丢失）
+//   expectedSeq=65535, seq=0 → diff=1   （回绕，跳了1个包）
+//   expectedSeq=101, seq=100 → diff=-1  （乱序，迟到的包）
+//   expectedSeq=1, seq=65534 → diff=-3  （回绕方向的乱序）
 //
 // 【核心算法 - 丢包检测】
 //
+// expectedSeq_ 代表"下一个期望收到的序列号"。
 // 当收到的包的序列号大于期望序列号时，说明中间有包缺失：
-//   diff = seq - expectedSeq
-//   丢包数 = diff - 1
+//   diff = seq - expectedSeq_
+//   丢包数 = diff
 //
-// 例如：期望 seq=100，收到 seq=103，则 diff=3，丢包数=2（seq 101, 102 丢失）
+// 例如：期望 seq=101，收到 seq=103，则 diff=2，丢包数=2（seq 101, 102 丢失）
 //
 // 注意：这种估算可能不准确，因为"缺失"的包可能只是迟到了（乱序），
 // 后续可能还会到达。但在实时通信中，通常将间隙视为丢包。
@@ -65,25 +67,31 @@ JitterBuffer::JitterBuffer(uint32_t targetDelayMs)
 //
 // 【算法流程】
 // 1. 递增接收计数器
-// 2. 如果是第一个包，用其序列号初始化 expectedSeq_，插入后返回
+// 2. 如果是第一个包，用其序列号+1初始化 expectedSeq_，插入后返回
 // 3. 计算序列号差值 diff（有符号，正确处理回绕）
 // 4. 根据 diff 的值进行不同处理：
-//    - diff == 0: 收到期望的包，正常插入
-//    - diff > 0:  收到未来的包，检测间隙并估算丢包数
-//    - diff < 0:  收到迟到/重复的包，仅插入缓冲区
+//    - diff == 0: 收到期望的包，正常插入，expectedSeq_ 前进
+//    - diff > 0:  收到未来的包，检测间隙并估算丢包数，expectedSeq_ 跳过间隙
+//    - diff < 0:  收到迟到/重复的包，仅插入缓冲区，不更新 expectedSeq_
+//
+// 【expectedSeq_ 的语义】
+// expectedSeq_ 代表"下一个期望收到的序列号"。
+// 每收到一个非迟到的包，expectedSeq_ 都会更新为 seq + 1。
 //
 // 【关于重复包】
 // 当 diff < 0 时，包可能是迟到的（之前被判定为丢包）或重复的。
 // 无论如何，将其插入缓冲区（如果已存在则覆盖），consume 时会处理。
+// 注意：之前已经将间隙计为丢包，这里不做修正（简化处理）。
 void JitterBuffer::insert(const RtpPacket& pkt) {
     receivedCount_++;
 
     // ========================================================================
     // 第一个包的特殊处理
-    // 用其序列号初始化 expectedSeq_，这样后续的包可以与之比较
+    // 用其序列号+1初始化 expectedSeq_，表示"下一个期望收到的序列号"
+    // 例如：第一个包 seq=100，则 expectedSeq_=101，期望下一个包是 101
     // ========================================================================
     if (firstPacket_) {
-        expectedSeq_ = pkt.sequenceNumber();
+        expectedSeq_ = pkt.sequenceNumber() + 1;
         firstPacket_ = false;
         buffer_[pkt.sequenceNumber()] = pkt;
         Logger::debug("JitterBuffer: first packet seq={}", pkt.sequenceNumber());
@@ -104,23 +112,26 @@ void JitterBuffer::insert(const RtpPacket& pkt) {
     if (diff == 0) {
         // ====================================================================
         // 收到期望的包（正常情况）
-        // 直接插入缓冲区
+        // seq 正好等于 expectedSeq_，说明没有丢包，按序到达
+        // 插入缓冲区，并将 expectedSeq_ 前进到下一个期望的序列号
         // ====================================================================
         buffer_[seq] = pkt;
+        expectedSeq_ = seq + 1;
     } else if (diff > 0) {
         // ====================================================================
         // 收到未来的包（seq > expectedSeq_）
-        // 说明中间有包缺失，估算丢包数
+        // 说明从 expectedSeq_ 到 seq-1 的包都缺失了
+        // 缺失的包数 = diff（即 seq - expectedSeq_）
+        //
+        // 例如: expectedSeq_=101, seq=103
+        //   缺失的包: 101, 102，共 2 个，diff=2
+        //   即使 diff=1 也意味着有 1 个包缺失（expectedSeq_ 本身）
         // ====================================================================
-        if (diff > 1) {
-            // diff > 1 表示有间隙，缺失的包数 = diff - 1
-            // 例如: expected=100, seq=103, diff=3, 缺失 101, 102 共 2 个包
-            lostCount_ += static_cast<uint64_t>(diff - 1);
-            Logger::debug("JitterBuffer: gap detected, expected {} got {}, {} lost",
-                          expectedSeq_, seq, diff - 1);
-        }
-        // diff == 1 表示紧邻的下一个包，没有丢包
+        lostCount_ += static_cast<uint64_t>(diff);
+        Logger::debug("JitterBuffer: gap detected, expected {} got {}, {} lost",
+                      expectedSeq_, seq, diff);
         buffer_[seq] = pkt;
+        expectedSeq_ = seq + 1;
     } else {
         // ====================================================================
         // 收到迟到或重复的包（seq < expectedSeq_）
@@ -133,6 +144,7 @@ void JitterBuffer::insert(const RtpPacket& pkt) {
         // 仍然插入缓冲区，consume 时会根据当前 expectedSeq_ 决定是否输出
         // 注意: 之前已经将间隙计为丢包，这里不做修正（简化处理）
         // ====================================================================
+        buffer_[seq] = pkt;
         Logger::debug("JitterBuffer: late/duplicate packet seq={}", seq);
     }
 }
@@ -181,17 +193,17 @@ std::vector<RtpPacket> JitterBuffer::consume() {
             // 输出该包，更新期望序列号
             // ==================================================================
             result.push_back(it->second);
-            expectedSeq_ = seq + 1;  // 期望下一个序列号
-            it = buffer_.erase(it);  // 从缓冲区移除已输出的包
+            expectedSeq_ = seq + 1;
+            it = buffer_.erase(it);
         } else if (diff <= 3) {
             // ==================================================================
             // 间隙较小（1-3个包），判定为丢包，不再等待
             // 跳过缺失的包，输出当前包
             // ==================================================================
-            expectedSeq_ = seq;  // 跳到当前序列号
+            expectedSeq_ = seq;
             result.push_back(it->second);
-            expectedSeq_ = seq + 1;  // 期望下一个序列号
-            it = buffer_.erase(it);  // 从缓冲区移除已输出的包
+            expectedSeq_ = seq + 1;
+            it = buffer_.erase(it);
         } else {
             // ==================================================================
             // 间隙较大（>3个包），可能包还在路上

@@ -143,18 +143,21 @@ private:
     std::map<uint16_t, RtpPacket> buffer_;
 
     // 期望的下一个 RTP 序列号
+    // 语义：下一个期望收到的序列号（不是上一个收到的序列号）
     // 用于检测丢包和乱序：
-    //   - 收到 seq == expectedSeq_: 正常
-    //   - 收到 seq > expectedSeq_: 有间隙，可能丢包
+    //   - 收到 seq == expectedSeq_: 正常，收到期望的包
+    //   - 收到 seq > expectedSeq_: 有间隙，丢包数 = seq - expectedSeq_
     //   - 收到 seq < expectedSeq_: 迟到或重复
+    // 每收到一个非迟到的包，expectedSeq_ 更新为 seq + 1
     uint16_t expectedSeq_ = 0;
 
     // 是否为第一个包的标志
-    // 第一个包到来时，用其序列号初始化 expectedSeq_
+    // 第一个包到来时，用其序列号+1初始化 expectedSeq_（下一个期望的序列号）
     bool firstPacket_ = true;
 
     // 丢包计数器
-    // 当检测到序列号间隙时，间隙大小 - 1 即为估算的丢包数
+    // 当检测到序列号间隙时，间隙大小（diff）即为估算的丢包数
+    // 例如: expectedSeq_=101, 收到 seq=103, diff=2, 丢包数=2（101,102缺失）
     uint64_t lostCount_ = 0;
 
     // 已接收包计数器
