@@ -123,11 +123,11 @@ src/media/rtcp/                        ← 新模块，与 src/media/rtp/ 平级
 
 | 文件 | 改动 |
 |------|------|
-| `transport_manager.h/cpp` | `PeerConnection` 内部按 RFC 5761 去复用（首字节低 7 位 ∈ [192,223] 判为 RTCP）：RTP 走现有 `onTrack` 不变；新增 `onRtcp` 回调与 `sendRtcp(bytes)` |
+| `transport_manager.h/cpp` | `PeerConnection` 内部按 RFC 5761 去复用（**第 2 字节** PT ∈ [192,223] 判为 RTCP，见文末勘误 1）：RTP 走现有 `onTrack` 不变；新增 `onRtcp` 回调与 `sendRtcp(bytes)` |
 | `jitter_buffer.h/cpp` | `insert()` 返回 `std::vector<uint16_t>`（本次新检测到的丢失 seq）；现有调用方忽略返回值不破坏兼容 |
 | `h264_encoder.h/cpp` | 新增 `forceKeyframe()`：置标志，下一帧强制 IDR |
 | `h264_decoder.h/cpp` | 新增 `onDecoderError` 回调：FFmpeg 返回错误或未产出帧时触发 |
-| `rtp_packetizer.*` | SSRC 由写死值改为随机生成（修复 Phase 1 遗留：两端同 SSRC 导致 RTCP 统计无法归属） |
+| `rtp_packetizer.*` | SSRC 由写死值改为随机生成（修复 Phase 1 遗留：两端同 SSRC 导致 RTCP 统计无法归属；实施时落点调整为 `main_client.cpp`，见文末勘误 2） |
 | SDP | 视频 m-line 补 `a=rtcp-fb:96 nack` 与 `a=rtcp-fb:96 nack pli`；实施时优先查 `Description::Media` 相关 API，兜底方案为 SDP 字符串后处理 |
 
 ### 3.6 集成接线（`main_client.cpp`）
@@ -201,4 +201,17 @@ PLI 触发源：解码错误（节流 500ms）。
 - RTT 为什么只能在发送侧算（需要 LSR/DLSR 配合本机时钟）
 - 重传缓冲为什么按"包数 + 时间"双维度淘汰
 - PLI 为什么需要节流（关键帧码率尖峰与风暴问题）
-- RFC 5761 的 RTP/RTCP 复用去复用规则（首字节 PT 区间）
+- RFC 5761 的 RTP/RTCP 复用去复用规则（第 2 字节 PT 区间 192-223）
+
+## 9. 实施勘误（设计与实现的偏差记录）
+
+1. **RFC 5761 去复用判定字段**：本文 3.5 节初稿误写"首字节低 7 位"。
+   RFC 5761 实际规则看的是**第 2 个字节**——RTCP 包类型字段取值
+   [192,223]，而 RTP 该字节是 M+PT（本实现 PT=96/97 落在区间外，判定
+   无歧义）。实现代码 `rtcp_packet.cpp:isRtcpPacket()` 与
+   `transport_manager.cpp:installTrackHandler()` 均按第 2 字节判定，
+   本节一并修正文档表述。
+2. **SSRC 随机化的落点**：设计计划改 `rtp_packetizer.*`，实施时为保持
+   打包器纯净（协议层不掺策略），落点调整为 `main_client.cpp` 初始化
+   段用 `std::random_device` 生成视频/音频 SSRC 后经 `setSsrc()` 注入。
+   打包器接口不变，效果等价。

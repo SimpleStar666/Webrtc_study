@@ -377,7 +377,15 @@ void appendPli(std::vector<uint8_t>& out, const PliPacket& pli) {
 // NACK PID+BLP 合并与展开
 // ============================================================================
 std::vector<NackEntry> NackPacket::buildEntries(std::vector<uint16_t> lostSeqs) {
-    std::sort(lostSeqs.begin(), lostSeqs.end());
+    if (lostSeqs.empty()) return {};
+    // 以首元素为基准的模 65536 排序：正确处理回绕
+    // （数值排序会把 {65534,65535,0,1} 拆散——0/1 排到最前，无法合并位图）
+    const uint16_t base = lostSeqs.front();
+    std::sort(lostSeqs.begin(), lostSeqs.end(),
+              [base](uint16_t a, uint16_t b) {
+                  return static_cast<uint16_t>(a - base) <
+                         static_cast<uint16_t>(b - base);
+              });
     lostSeqs.erase(std::unique(lostSeqs.begin(), lostSeqs.end()), lostSeqs.end());
 
     std::vector<NackEntry> out;
