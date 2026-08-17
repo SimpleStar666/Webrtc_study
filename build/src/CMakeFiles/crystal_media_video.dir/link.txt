@@ -1,2 +1,0 @@
-/usr/bin/ar qc libcrystal_media_video.a CMakeFiles/crystal_media_video.dir/media/video/v4l2_capture.cpp.o CMakeFiles/crystal_media_video.dir/media/video/h264_encoder.cpp.o CMakeFiles/crystal_media_video.dir/media/video/h264_decoder.cpp.o CMakeFiles/crystal_media_video.dir/media/video/sdl_renderer.cpp.o
-/usr/bin/ranlib libcrystal_media_video.a

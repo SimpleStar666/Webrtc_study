@@ -1,1 +1,0 @@
-/usr/bin/c++ -g "CMakeFiles/datachannel-client.dir/main.cpp.o" "CMakeFiles/datachannel-client.dir/parse_cl.cpp.o" -o client  -Wl,-rpath,/workspace/build/_deps/libdatachannel-build ../../libdatachannel.so.0.21.2 

@@ -18,7 +18,7 @@ add_library(crystal_transport STATIC
     transport/transport_manager.cpp
 )
 target_include_directories(crystal_transport PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(crystal_transport PUBLIC crystal_utils datachannel)
+target_link_libraries(crystal_transport PUBLIC crystal_utils datachannel crystal_media_rtcp)
 
 # --- Media: RTP ---
 add_library(crystal_media_rtp STATIC
@@ -29,6 +29,16 @@ add_library(crystal_media_rtp STATIC
 )
 target_include_directories(crystal_media_rtp PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(crystal_media_rtp PUBLIC crystal_utils)
+
+# --- Media: RTCP ---
+add_library(crystal_media_rtcp STATIC
+    media/rtcp/rtcp_packet.cpp
+    media/rtcp/retransmission_buffer.cpp
+    media/rtcp/nack_requester.cpp
+    media/rtcp/rtcp_reporter.cpp
+)
+target_include_directories(crystal_media_rtcp PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(crystal_media_rtcp PUBLIC crystal_utils)
 
 # --- Media: Video ---
 add_library(crystal_media_video STATIC

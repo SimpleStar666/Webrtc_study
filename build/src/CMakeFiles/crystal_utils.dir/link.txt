@@ -1,2 +1,0 @@
-/usr/bin/ar qc libcrystal_utils.a CMakeFiles/crystal_utils.dir/utils/logger.cpp.o
-/usr/bin/ranlib libcrystal_utils.a

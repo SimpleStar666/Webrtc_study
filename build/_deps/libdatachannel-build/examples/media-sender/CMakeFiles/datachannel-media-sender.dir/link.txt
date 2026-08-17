@@ -1,1 +1,0 @@
-/usr/bin/c++ -g "CMakeFiles/datachannel-media-sender.dir/main.cpp.o" -o media-sender  -Wl,-rpath,/workspace/build/_deps/libdatachannel-build ../../libdatachannel.so.0.21.2 

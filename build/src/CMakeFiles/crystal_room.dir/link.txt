@@ -1,2 +1,0 @@
-/usr/bin/ar qc libcrystal_room.a CMakeFiles/crystal_room.dir/room/room_manager.cpp.o
-/usr/bin/ranlib libcrystal_room.a

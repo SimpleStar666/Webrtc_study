@@ -398,6 +398,99 @@ pc_->onStateChange([](rtc::PeerConnection::State state) {
 
 ---
 
+## Module 8: RTCP 反馈体系 — NACK/PLI/SR/RR
+
+### 概念讲解
+
+RTP 只管传媒体数据，网络质量谁来管？RTCP（RTP Control Protocol）负责
+交换控制信息，让收发双方知道"网络怎么样了"，并支撑丢包恢复：
+
+```
+RTP 包:  [seq=100] [seq=102] [seq=103]    ← 101 丢了
+              │
+              ▼ 接收端 JitterBuffer 检测到间隙
+NACK:    "请重传 seq=101"                  ← 专用 RTCP 包，捎带点名
+              │
+              ▼ 发送端查重传缓冲，补发原包
+重传:    [seq=101]
+```
+
+四种核心 RTCP 包：
+
+| 包 | 类型号 | 作用 |
+|----|--------|------|
+| SR (Sender Report) | 200 | 发送端声明：发了多少包/字节 + NTP/RTP 时间戳对（用于同步） |
+| RR (Receiver Report) | 201 | 接收端反馈：丢包率/抖动/最高序号，每条流一个报告块 |
+| NACK (RTPFB) | 205 | 接收端点名重传：FCI 放丢失 seq 的 PID + 16 位位图 |
+| PLI (PSFB) | 206 | 接收端请求关键帧：解码崩了别硬撑，给我个 IDR 重新开始 |
+
+**RTP 和 RTCP 复用一个端口，怎么区分？**（RFC 5761，本项目实现）
+看第 **2** 个字节：RTCP 包类型 ∈ [192,223]；RTP 的 M+PT 组合必须避开
+这段区间（本项目 PT=96/97，无歧义）。
+
+**RTT 怎么算？**（RFC 3550 A.6，LSR/DLSR 法，全程无需两端时钟同步）
+
+```
+发送端 A 在 SR 里带 NTP 时间戳
+  → 接收端 B 在 RR 里回显两个字段：
+     LSR = 最近收到的那个 SR 的 NTP 时间戳中间 32 位
+     DLSR = 收到 SR 到发出 RR 的间隔（1/65536 秒单位）
+  → A 收到 RR：RTT = 当前NTP时间 - LSR - DLSR
+```
+
+**丢包恢复的分工：**
+- NACK：零星丢包（约 <10%）→ 重传划得来（延迟换质量）
+- PLI：丢太多/参考帧丢了 → 重传来不及，直接要关键帧（带宽换恢复）
+- 兜底逻辑：NACK 重试 3 次未恢复 → 放弃，交给 PLI 恢复
+
+### 代码走读
+
+| 文件 | 关键内容 |
+|------|----------|
+| `src/media/rtcp/rtcp_packet.cpp` | 协议层：SR/RR/NACK/PLI 的序列化、解析、复合包迭代 |
+| `src/media/rtcp/retransmission_buffer.cpp` | 发送端重传缓冲：存已发包（512 包/3s TTL），NACK 来了查表补发 |
+| `src/media/nack_requester.cpp` | 接收端状态机：请求 → 33ms 重试 → 3 次放弃 |
+| `src/media/rtcp/rtcp_reporter.cpp` | SR/RR 构建 + 丢包/抖动/RTT 统计（LSR/DLSR 法） |
+| `main_client.cpp` | 全链路接线：每 5s 发 SR/RR、处理收到的 NACK/PLI、打印统计行 |
+
+**NACK 的 PID+BLP 位图（一个条目点名 17 个 seq）：**
+```cpp
+// FCI：2 字节 PID（最早丢的 seq）+ 2 字节 BLP（其后 16 个 seq 的位图）
+// 例：100、102、103 丢 → PID=100，BLP 的第 2、3 位置 1
+NackPacket::buildEntries(seqs);  // 自动按模 65536 排序分组，正确处理回绕
+```
+
+**抖动的指数平滑（RFC 3550 A.8）：**
+```cpp
+jitter_ += (d - jitter_) / 16.0;   // d = 本包到达间隔偏差
+// 除以 16：平滑系数，防止单个网络毛刺拉高抖动值
+```
+
+### 动手练习
+
+1. **观察 NACK 生效**：用 `tc netem` 注入 5% 丢包（命令见 USAGE.md），
+   对照 `[stats]` 行——实际丢包率应明显低于注入值，说明重传在补包
+2. **改参数做实验**：把 NackRequester 重试次数从 3 改成 10，在 30% 丢包下
+   观察"放弃"计数与画面恢复速度的变化，体会"重传也丢"的边际效应
+3. **看协议字节**：在 `sendRtcp` 处加打印，dump NACK 包十六进制，
+   对照 RFC 4585 逐字节验证 V/P/PT/length 头部与 FCI 的 PID/BLP
+
+### 面试高频题
+
+1. **NACK 和 PLI 各适合什么场景？** NACK 适合零星丢包（重传延迟可控）；
+   PLI 适合连续丢包或参考帧损坏——后续帧全部无法解码，只能要关键帧重新同步。
+2. **RTT 为什么用 LSR/DLSR 而不是 ping？** 捎带在既有 SR/RR 里零额外带宽、
+   测的就是媒体路径本身，且不要求两端时钟同步（DLSR 抵消了 B 的时钟基准）。
+3. **RTP/RTCP 复用怎么区分？** RFC 5761：看第 2 字节，RTCP 类型 192-223；
+   协商 RTP payload type 时避开 64-95 区间防歧义。
+4. **NACK 风暴怎么防？** ① JitterBuffer 大间隙（>64）不报，直接跳序；
+   ② NackRequester 状态机天然去重（同一 seq 只有一份待办）+ 重试上限；
+   ③ PLI 节流 500ms 防关键帧风暴（关键帧大，会挤占带宽）。
+5. **fraction lost 为什么只有 8 位？** 0-255 线性映射 0%-100%，报告块定长
+   24 字节，8 位足以表达"自上份报告以来"的增量丢包率，紧凑省空间。
+
+---
+
 ## 综合练习
 
 ### 练习 A：端到端数据流追踪

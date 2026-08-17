@@ -1,1 +1,0 @@
-/usr/bin/c++ -g "CMakeFiles/datachannel-benchmark.dir/test/benchmark.cpp.o" -o benchmark-0.21.2  -Wl,-rpath,/workspace/build/_deps/libdatachannel-build libdatachannel.so.0.21.2 
