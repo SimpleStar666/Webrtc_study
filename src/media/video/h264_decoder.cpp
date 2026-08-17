@@ -164,6 +164,7 @@ void H264Decoder::decode(const uint8_t* nalData, size_t nalLen) {
     int ret = avcodec_send_packet(codecCtx_, pkt_);
     if (ret < 0) {
         Logger::debug("Failed to send packet to decoder: {}", ret);
+        if (errorCb_) errorCb_();  // 码流损坏 → 通知上层请求关键帧
         return;
     }
 
@@ -181,6 +182,11 @@ void H264Decoder::decode(const uint8_t* nalData, size_t nalLen) {
             // 或 avcodec_send_packet() 调用后可能失效，上层如需持久化应拷贝数据
             decodedCb_(frame_->data[0], frame_->width, frame_->height);
         }
+        // 错误隐藏检测：FFmpeg 对损坏的 P 帧会输出"修补"帧而非报错，
+        // decode_error_flags 非零表示该帧存在错误隐藏（花屏风险）
+        if (frame_->decode_error_flags != 0 && errorCb_) {
+            errorCb_();
+        }
     }
 }
 
@@ -190,6 +196,13 @@ void H264Decoder::decode(const uint8_t* nalData, size_t nalLen) {
 // @param cb  回调函数，每帧解码完成时被调用
 void H264Decoder::onDecoded(DecodedCallback cb) {
     decodedCb_ = std::move(cb);
+}
+
+// ============================================================================
+// H264Decoder::onError() - 注册解码错误回调
+// ============================================================================
+void H264Decoder::onError(ErrorCallback cb) {
+    errorCb_ = std::move(cb);
 }
 
 } // namespace crystal

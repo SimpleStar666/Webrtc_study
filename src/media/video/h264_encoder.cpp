@@ -167,6 +167,11 @@ bool H264Encoder::init() {
     // 现代 WebRTC 也支持 Main/High Profile，但 Baseline 仍是安全选择
     av_opt_set(codecCtx_->priv_data, "profile", "baseline", 0);
 
+    // 强制 IDR：libx264 的私有选项。开启后通过 frame->pict_type=I 请求的
+    // 关键帧会被编为 IDR（可立即刷新解码端画面），而非普通 I 帧
+    // （普通 I 帧仍引用旧帧，无法从花屏中恢复——PLI 响应的关键）
+    av_opt_set(codecCtx_->priv_data, "forced-idr", "1", 0);
+
     // ---- 第五步：打开编码器 ----
     // avcodec_open2 完成编码器的最终初始化，包括验证参数、分配内部缓冲区等
     // 此调用后，编码器参数被锁定，不可再修改
@@ -241,6 +246,18 @@ void H264Encoder::encode(const uint8_t* yuvData, size_t len) {
     // PTS 告诉解码器这一帧应该在什么时间显示，是音视频同步的关键
     // 配合 time_base = {1, fps}，PTS 值即为帧序号
     frame_->pts = pts_++;
+
+    // 关键帧强制（PLI 响应）：pict_type 显式指定 I 帧，配合 init() 中
+    // 的 forced-idr 选项由 libx264 编为 IDR
+    // 注意：frame_ 是复用对象，必须每帧重置，否则标志消费一次后会
+    // 永久保持 I 帧（每帧都是关键帧，码率暴涨）
+    if (forceKeyframe_) {
+        frame_->pict_type = AV_PICTURE_TYPE_I;
+        forceKeyframe_ = false;
+        Logger::info("Encoder: forcing keyframe (PLI response)");
+    } else {
+        frame_->pict_type = AV_PICTURE_TYPE_NONE;  // 交回编码器按 GOP 决定
+    }
 
     // ---- 将帧送入编码器 ----
     // avcodec_send_frame() 将帧放入编码器的输入队列
@@ -322,6 +339,16 @@ void H264Encoder::processPacket(AVPacket* pkt) {
 // @param cb  回调函数，每次 NAL 单元编码完成时被调用
 void H264Encoder::onEncoded(EncodedCallback cb) {
     encodedCb_ = std::move(cb);
+}
+
+// ============================================================================
+// H264Encoder::forceKeyframe() - 请求下一帧强制 IDR
+// ============================================================================
+// 仅置标志，真正的动作在 encode() 中执行（编码由采集帧驱动，调用方无法
+// 直接触发一次编码）。这是"命令-检查"模式的典型用法，跨线程也安全：
+// 本端编码线程是唯一写者，标志本身是原子语义的 bool。
+void H264Encoder::forceKeyframe() {
+    forceKeyframe_ = true;
 }
 
 } // namespace crystal

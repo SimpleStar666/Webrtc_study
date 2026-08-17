@@ -88,6 +88,17 @@ public:
     // @param cb  回调函数，每帧解码完成时被调用
     void onDecoded(DecodedCallback cb);
 
+    // 解码错误回调类型（无参数：调用方只需知道"该请求关键帧了"）
+    using ErrorCallback = std::function<void()>;
+
+    // 注册解码错误回调
+    // 触发时机：
+    //   1. avcodec_send_packet 返回错误（码流严重损坏无法送入）
+    //   2. 解码输出的帧带 decode_error_flags（FFmpeg 用错误隐藏技术
+    //      "猜"出来的帧，视觉上通常表现为花屏/绿屏）
+    // 上层典型处理：节流后发 RTCP PLI 请求对端编出关键帧
+    void onError(ErrorCallback cb);
+
 private:
     AVCodecContext* codecCtx_ = nullptr; // FFmpeg 解码器上下文，保存解码器全部运行状态
     AVFrame* frame_ = nullptr;           // 解码输出帧结构，存储解码后的 YUV 数据
@@ -95,6 +106,7 @@ private:
                                          // 与编码器不同，解码器持久化 AVPacket 以避免频繁分配
     bool initialized_ = false;           // 初始化状态标志，防止未初始化时调用 decode()
     DecodedCallback decodedCb_;          // 解码完成回调函数
+    ErrorCallback errorCb_;              // 解码错误回调函数
 };
 
 } // namespace crystal

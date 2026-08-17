@@ -118,6 +118,11 @@ public:
     // @param cb  回调函数，每次 NAL 单元编码完成时被调用
     void onEncoded(EncodedCallback cb);
 
+    // 请求下一帧强制编码为 IDR 关键帧（响应 RTCP PLI）
+    // 场景：对端解码失败/重传放弃后调用，关键帧可独立解码，使画面立即恢复。
+    // 幂等：重复调用在下一帧只产生一个 IDR
+    void forceKeyframe();
+
 private:
     // 处理编码输出的 AVPacket
     // 解析 AVCC 格式（4字节大端长度前缀 + NAL 数据），逐个提取 NAL 单元并触发回调
@@ -130,6 +135,7 @@ private:
     int64_t pts_ = 0;               // 显示时间戳（Presentation Time Stamp），单调递增
                                     // 编码器按 PTS 顺序输出，确保解码端正确播放顺序
     EncodedCallback encodedCb_;     // 编码完成回调函数
+    bool forceKeyframe_ = false;    // 关键帧请求标志（encode 时消费并复位）
 };
 
 } // namespace crystal
