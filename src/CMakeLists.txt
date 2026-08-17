@@ -18,7 +18,7 @@ add_library(crystal_transport STATIC
     transport/transport_manager.cpp
 )
 target_include_directories(crystal_transport PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(crystal_transport PUBLIC crystal_utils datachannel)
+target_link_libraries(crystal_transport PUBLIC crystal_utils datachannel crystal_media_rtcp)
 
 # --- Media: RTP ---
 add_library(crystal_media_rtp STATIC

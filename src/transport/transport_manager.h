@@ -91,6 +91,11 @@ public:
     // 参数：data - 接收到的媒体数据（已从 rtc::binary 转换为 std::vector<uint8_t>）
     using TrackCallback = std::function<void(const std::vector<uint8_t>& data)>;
 
+    // RTCP 数据接收回调函数类型
+    // PeerConnection 内部已按 RFC 5761 完成 RTP/RTCP 去复用，
+    // 本回调只收到 RTCP 报文（可能是含多个子包的复合包）
+    using RtcpCallback = std::function<void(const std::vector<uint8_t>& data)>;
+
     // 连接状态变化回调函数类型
     // 当 PeerConnection 的状态发生变化时触发
     // 参数：state - 新的连接状态（New/Connecting/Connected/Disconnected/Failed/Closed）
@@ -149,6 +154,14 @@ public:
     // 参数：data - 包含媒体数据的 vector
     void sendMedia(const std::vector<uint8_t>& data);
 
+    // 发送 RTCP 报文（与 RTP 同 Track 同端口复用，RFC 5761）
+    // track 未就绪时静默丢弃（设计文档错误处理表约定）
+    void sendRtcp(const std::vector<uint8_t>& data);
+
+    // 设置 RTCP 接收回调
+    // 参数：cb - 回调函数，收到远端 RTCP 复合包时调用
+    void onRtcp(RtcpCallback cb);
+
     // 设置 ICE 候选回调
     // 参数：cb - 回调函数，当本地收集到新的 ICE Candidate 时调用
     void onIceCandidate(IceCandidateCallback cb);
@@ -187,6 +200,13 @@ private:
 
     // 媒体数据接收回调
     TrackCallback trackCb_;
+
+    // RTCP 数据接收回调
+    RtcpCallback rtcpCb_;
+
+    // 统一安装 Track 的消息回调（RTP/RTCP 去复用后分发）
+    // createOffer 与 onTrack 两处创建 Track 都走此函数，避免逻辑重复
+    void installTrackHandler();
 
     // 连接状态变化回调
     StateCallback stateCb_;

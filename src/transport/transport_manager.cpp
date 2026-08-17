@@ -29,6 +29,7 @@
 
 #include "transport/transport_manager.h"
 #include "utils/logger.h"
+#include "media/rtcp/rtcp_packet.h"   // isRtcpPacket：RFC 5761 去复用判定
 #include <rtc/rtc.hpp>
 #include <random>
 #include <sstream>
@@ -62,6 +63,30 @@ static rtc::binary vecToBinary(const uint8_t* data, size_t len) {
         result[i] = static_cast<std::byte>(data[i]);
     }
     return result;
+}
+
+// ============================================================================
+// injectRtcpFb - 向 SDP 的 m=video 节注入 rtcp-fb 反馈能力声明
+// ============================================================================
+// 【为什么用字符串后处理而非 libdatachannel API】
+// libdatachannel 的 Description::Media 未公开按 payload type 添加
+// a=rtcp-fb 的接口（兜底方案，设计文档 3.5 节）。
+// 本项目两端都是 CrystalRTC，PT=96 为双方约定值，此属性为声明性信息：
+// 我方 NACK/PLI 的收发不依赖 SDP 协商结果，但完整的 SDP 有利于
+// 将来与浏览器互操作（浏览器只对 SDP 声明了 rtcp-fb 的 PT 发 NACK）。
+// 幂等：已包含 rtcp-fb 则原样返回。
+static std::string injectRtcpFb(const std::string& sdp) {
+    if (sdp.find("a=rtcp-fb:96") != std::string::npos) {
+        return sdp;  // 已注入过（createOffer/createAnswer 都会走到这里）
+    }
+    auto mpos = sdp.find("m=video");
+    if (mpos == std::string::npos) return sdp;
+    auto lineEnd = sdp.find('\n', mpos);
+    if (lineEnd == std::string::npos) return sdp;
+    // 插到 m=video 行之后：nack（通用 NACK）+ nack pli（PLI 经由 PSFB）
+    const std::string fb = "a=rtcp-fb:96 nack\r\na=rtcp-fb:96 nack pli\r\n";
+    std::string result = sdp;  // sdp 是 const 引用，拷贝后才能原地插入
+    return result.insert(lineEnd + 1, fb);
 }
 
 // ============================================================================
@@ -166,17 +191,8 @@ std::string PeerConnection::createOffer() {
     auto track = pc_->addTrack(video);
     if (track) {
         track_ = track;
-
-        // 设置 Track 的消息回调
-        // 当通过此 Track 接收到远端媒体数据时触发
-        // 参数1: 消息回调（接收 rtc::binary 即 std::vector<std::byte>）
-        // 参数2: nullptr 表示不设置字符串消息回调（媒体数据都是二进制的）
-        track_->onMessage([this](const rtc::binary& data) {
-            if (trackCb_) {
-                // 将 rtc::binary 转换为 std::vector<uint8_t> 后回调
-                trackCb_(binaryToVec(data));
-            }
-        }, nullptr);
+        // 安装去复用消息回调（RTP → onTrack / RTCP → onRtcp）
+        installTrackHandler();
     }
 
     // 获取本地 SDP 描述
@@ -186,7 +202,8 @@ std::string PeerConnection::createOffer() {
     // - DTLS 指纹（用于验证 DTLS 握手对方身份）
     auto desc = pc_->localDescription();
     if (desc) {
-        return std::string(*desc);
+        // 注入 rtcp-fb 能力声明后再返回给信令
+        return injectRtcpFb(std::string(*desc));
     }
 
     return "";
@@ -198,7 +215,8 @@ std::string PeerConnection::createOffer() {
 std::string PeerConnection::createAnswer() {
     auto desc = pc_->localDescription();
     if (desc) {
-        return std::string(*desc);
+        // 与 createOffer 一致：注入 rtcp-fb 能力声明
+        return injectRtcpFb(std::string(*desc));
     }
     return "";
 }
@@ -225,14 +243,7 @@ void PeerConnection::setRemoteDescription(const std::string& sdp,
     if (!track_) {
         pc_->onTrack([this](std::shared_ptr<rtc::Track> track) {
             track_ = track;
-
-            // 设置远端 Track 的消息回调
-            // 接收远端发送的媒体数据（如视频帧）
-            track_->onMessage([this](const rtc::binary& data) {
-                if (trackCb_) {
-                    trackCb_(binaryToVec(data));
-                }
-            }, nullptr);
+            installTrackHandler();  // 被叫路径：远端 Track 到达同样装回调
         });
     }
 }
@@ -272,6 +283,44 @@ void PeerConnection::sendMedia(const std::vector<uint8_t>& data) {
 // 设置 ICE 候选回调
 void PeerConnection::onIceCandidate(IceCandidateCallback cb) {
     iceCandidateCb_ = std::move(cb);
+}
+
+// ============================================================================
+// PeerConnection::installTrackHandler() - 安装 Track 消息回调（去复用）
+// ============================================================================
+// RFC 5761 RTP/RTCP 复用区分规则（勘误版，见计划头部说明）：
+// 看第 2 个字节——RTCP 包类型 ∈ [192,223]；RTP 的 M+PT 组合
+// （本项目 PT=96/97，最大 225）落在区间外，判定无歧义。
+void PeerConnection::installTrackHandler() {
+    track_->onMessage([this](const rtc::binary& data) {
+        auto bytes = binaryToVec(data);
+        if (isRtcpPacket(bytes.data(), bytes.size())) {
+            // RTCP 复合包 → 独立通道交给上层（NACK/PLI/SR/RR 处理）
+            if (rtcpCb_) rtcpCb_(bytes);
+        } else if (trackCb_) {
+            // RTP 包 → 原有媒体链路不变
+            trackCb_(bytes);
+        }
+    }, nullptr);
+}
+
+// ============================================================================
+// PeerConnection::sendRtcp() - 发送 RTCP 报文
+// ============================================================================
+// RTCP 与 RTP 走同一条 Track：libdatachannel 把它当作不透明字节经 SRTP
+// 发出（RTCP 也受 SRTP 保护），对端用同款去复用逻辑识别。
+void PeerConnection::sendRtcp(const std::vector<uint8_t>& data) {
+    if (track_ && track_->isOpen()) {
+        track_->send(vecToBinary(data.data(), data.size()));
+    }
+    // track 未就绪：静默丢弃（连接建立早期 RTCP 定时器可能已到期）
+}
+
+// ============================================================================
+// PeerConnection::onRtcp() - 设置 RTCP 接收回调
+// ============================================================================
+void PeerConnection::onRtcp(RtcpCallback cb) {
+    rtcpCb_ = std::move(cb);
 }
 
 // 设置媒体数据接收回调
