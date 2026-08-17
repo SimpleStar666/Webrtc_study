@@ -86,7 +86,10 @@ JitterBuffer::JitterBuffer(uint32_t targetDelayMs)
 // 当 diff < 0 时，包可能是迟到的（之前被判定为丢包）或重复的。
 // 无论如何，将其插入缓冲区（如果已存在则覆盖），consume 时会处理。
 // 注意：之前已经将间隙计为丢包，这里不做修正（简化处理）。
-void JitterBuffer::insert(const RtpPacket& pkt) {
+std::vector<uint16_t> JitterBuffer::insert(const RtpPacket& pkt) {
+    // 本次新检测到的丢失序列号（供上层发起 NACK 重传请求）
+    std::vector<uint16_t> missing;
+
     receivedCount_++;
 
     // ========================================================================
@@ -101,7 +104,7 @@ void JitterBuffer::insert(const RtpPacket& pkt) {
         firstPacket_ = false;
         buffer_[pkt.sequenceNumber()] = pkt;
         Logger::debug("JitterBuffer: first packet seq={}", pkt.sequenceNumber());
-        return;
+        return missing;
     }
 
     uint16_t seq = pkt.sequenceNumber();
@@ -123,14 +126,20 @@ void JitterBuffer::insert(const RtpPacket& pkt) {
     } else if (diff > 0) {
         // ====================================================================
         // 收到未来的包（seq > expectedSeq_）
-        // 说明从 expectedSeq_ 到 seq-1 的包都缺失了
         // 缺失的包数 = diff（即 seq - expectedSeq_）
-        //
-        // 例如: expectedSeq_=101, seq=103
-        //   缺失的包: 101, 102，共 2 个，diff=2
-        //   即使 diff=1 也意味着有 1 个包缺失（expectedSeq_ 本身）
+        // 例如: expectedSeq_=101, seq=103 → 缺失 101,102
         // ====================================================================
         lostCount_ += static_cast<uint64_t>(diff);
+        if (diff <= kMaxNackGap) {
+            // 小间隙：把缺失的 seq 报告给上层做 NACK 重传请求
+            for (int i = 0; i < diff; i++) {
+                missing.push_back(static_cast<uint16_t>(expectedSeq_ + i));
+            }
+        } else {
+            // 大间隙：疑似码流中断/重连，请求重传只会造成 NACK 风暴，
+            // 画面恢复交给 PLI（关键帧请求）
+            Logger::warn("JitterBuffer: huge gap ({}), skip NACK report", diff);
+        }
         Logger::debug("JitterBuffer: gap detected, expected {} got {}, {} lost",
                       expectedSeq_, seq, diff);
         buffer_[seq] = pkt;
@@ -150,6 +159,8 @@ void JitterBuffer::insert(const RtpPacket& pkt) {
         buffer_[seq] = pkt;
         Logger::debug("JitterBuffer: late/duplicate packet seq={}", seq);
     }
+
+    return missing;
 }
 
 // ============================================================================
