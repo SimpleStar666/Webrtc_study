@@ -80,11 +80,17 @@
 #include "media/rtp/rtp_depacketizer.h"
 #include "media/rtp/jitter_buffer.h"
 #include "room/room_manager.h"
+#include "media/rtcp/rtcp_packet.h"
+#include "media/rtcp/retransmission_buffer.h"
+#include "media/rtcp/nack_requester.h"
+#include "media/rtcp/rtcp_reporter.h"
 #include <iostream>
 #include <string>
 #include <thread>
 #include <atomic>
 #include <csignal>
+#include <random>
+#include <chrono>
 
 // 全局运行标志，用于优雅退出
 static std::atomic<bool> g_running{true};
@@ -92,6 +98,13 @@ static std::atomic<bool> g_running{true};
 // 信号处理函数：捕获 Ctrl+C (SIGINT)，设置运行标志为 false 以退出主循环
 static void signalHandler(int) {
     g_running = false;
+}
+
+// 单调时钟毫秒数（RTCP 组件的统一时间源，避免系统时间跳变影响）
+static uint64_t nowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
 }
 
 // ============================================================================
@@ -136,16 +149,40 @@ int main(int argc, char* argv[]) {
     auto pc = transportMgr.createPeerConnection();
 
     // ---- 步骤3：创建 RTP 打包/解包/抖动缓冲区 ----
-    // 视频打包器：PT=96（动态类型，H.264），时钟=90000Hz，SSRC=0x12345678
-    crystal::RtpPacketizer videoPacketizer(96, 90000, 0x12345678);
-    // 音频打包器：PT=97（动态类型，Opus），时钟=48000Hz，SSRC=0x87654321
-    crystal::RtpPacketizer audioPacketizer(97, 48000, 0x87654321);
+    // SSRC 随机生成：Phase 1 两端都写死固定值，RTCP 报告块将无法
+    // 区分统计属于哪条流；随机化后每条流全局唯一（RFC 3550 8.1 建议）。
+    // 初始序列号同样随机化（RFC 3550 5.1：增大攻击者猜测难度）
+    std::random_device rd;
+    uint32_t videoSsrc = rd();
+    uint32_t audioSsrc = rd();
+    // 视频打包器：PT=96（H.264），时钟=90000Hz
+    crystal::RtpPacketizer videoPacketizer(96, 90000, videoSsrc,
+                                           static_cast<uint16_t>(rd() & 0xFFFF));
+    // 音频打包器：PT=97（Opus），时钟=48000Hz
+    crystal::RtpPacketizer audioPacketizer(97, 48000, audioSsrc,
+                                           static_cast<uint16_t>(rd() & 0xFFFF));
     // 解包器：从 RTP 包中提取 H.264 NAL 或 Opus 帧
     crystal::RtpDepacketizer depacketizer;
-    // 视频抖动缓冲区：缓存40个包，解决乱序和抖动
+    // 视频抖动缓冲区：解决乱序和抖动，并检测丢失 seq（NACK 数据源）
     crystal::JitterBuffer videoJitterBuf(40);
-    // 音频抖动缓冲区：缓存40个包
+    // 音频抖动缓冲区
     crystal::JitterBuffer audioJitterBuf(40);
+
+    // ---- 步骤3b：RTCP 反馈组件 ----
+    // 发送侧：已发视频包缓存，响应对端 NACK 补发（音频不做 NACK——
+    // 重传到达已错过播放时刻，Opus 自带 PLC 丢包隐藏更划算）
+    crystal::RetransmissionBuffer retxBuffer;
+    // 接收侧：丢失包请求状态机（立即请求 + 33ms 重试 + 3 次放弃）
+    crystal::NackRequester nackRequester;
+    // 统计：发送侧构造 SR / 接收侧构造 RR 报告块（每流一对）
+    crystal::SendSideReporter videoSendReport(videoSsrc, "crystal-video");
+    crystal::SendSideReporter audioSendReport(audioSsrc, "crystal-audio");
+    crystal::RecvSideReporter videoRecvReport(90000);  // 收对端视频(PT=96)
+    crystal::RecvSideReporter audioRecvReport(48000);  // 收对端音频(PT=97)
+    // 本端是否已发出过包（决定周期发 SR 还是纯 RR，RFC 3550 6.4）
+    bool videoSent = false, audioSent = false;
+    // 当前帧的 RTP 时间戳（修复 Phase 1 全 0 时间戳问题，见回调5）
+    uint32_t videoRtpTs = 0, audioRtpTs = 0;
 
     // ---- 步骤4：创建音视频编解码器 ----
     // 视频编码器：将 YUV 帧编码为 H.264 NAL Unit
@@ -182,16 +219,56 @@ int main(int argc, char* argv[]) {
     // 以下回调的注册顺序不影响功能，但逻辑上按数据流方向排列
     // ====================================================================
 
+    // ---- 辅助：发 PLI（500ms 节流）----
+    // 关键帧体积是 P 帧数倍，无节流会造成"错误→PLI→大帧→更易丢→错误"
+    // 的正反馈风暴，挤占正常媒体带宽
+    uint64_t lastPliSentMs = 0;
+    auto sendPli = [&]() {
+        if (!videoRecvReport.active()) return;   // 还不知道对端视频 SSRC
+        uint64_t now = nowMs();
+        if (now - lastPliSentMs < 500) return;   // 节流
+        lastPliSentMs = now;
+        crystal::PliPacket pli;
+        pli.senderSsrc = videoSsrc;              // 发起方（本端）SSRC
+        pli.mediaSsrc = videoRecvReport.remoteSsrc();  // 被请求的媒体流
+        std::vector<uint8_t> buf;
+        crystal::appendPli(buf, pli);
+        pc->sendRtcp(buf);
+        crystal::Logger::info("RTCP: PLI sent (keyframe requested)");
+    };
+
+    // ---- 辅助：发 NACK（seq 列表 → PID+BLP 位图压缩）----
+    auto sendNack = [&](const std::vector<uint16_t>& seqs) {
+        if (seqs.empty() || !videoRecvReport.active()) return;
+        crystal::NackPacket nack;
+        nack.senderSsrc = videoSsrc;
+        nack.mediaSsrc = videoRecvReport.remoteSsrc();
+        nack.entries = crystal::NackPacket::buildEntries(seqs);
+        std::vector<uint8_t> buf;
+        crystal::appendNack(buf, nack);
+        pc->sendRtcp(buf);
+    };
+
     // ---- 回调1：接收远端媒体数据 ----
     // 当 PeerConnection 收到远端发来的 RTP 包时触发此回调
-    // 数据流：网络 → RTP包 → 按PT分流 → JitterBuffer → 解包 → 解码 → 渲染/播放
+    // 数据流：网络 → RTP包 → 统计+NACK检测 → JitterBuffer → 解包 → 解码 → 渲染/播放
     pc->onTrack([&](const std::vector<uint8_t>& data) {
         crystal::RtpPacket pkt;
         if (!pkt.parse(data.data(), data.size())) return;  // 解析 RTP 包失败则丢弃
 
         if (pkt.payloadType() == 96) {
-            // 视频流（PT=96）：RTP包 → JitterBuffer → 解包 → H.264解码 → 渲染
-            videoJitterBuf.insert(pkt);                    // 送入视频抖动缓冲区
+            // === 接收统计（RR 数据源）：丢包/回绕/抖动 ===
+            videoRecvReport.onPacketReceived(pkt.ssrc(), pkt.sequenceNumber(),
+                                             pkt.timestamp(), crystal::nowNtp());
+            // === NACK 状态机联动 ===
+            // 任意到达的包（含重传包）都解除对应 seq 的待请求状态
+            nackRequester.onReceived(pkt.sequenceNumber());
+            // insert 返回本次新检测到的丢失 seq（≤64 的小间隙才有值）
+            auto missing = videoJitterBuf.insert(pkt);
+            // 状态机过滤出"现在就该请求"的 seq（其余进入重试队列）
+            auto toRequest = nackRequester.onMissing(missing, nowMs());
+            sendNack(toRequest);
+
             auto packets = videoJitterBuf.consume();       // 获取有序的 RTP 包
             for (const auto& p : packets) {
                 auto nals = depacketizer.depacketizeH264(p);  // RTP 解包为 NAL Unit
@@ -200,8 +277,10 @@ int main(int argc, char* argv[]) {
                 }
             }
         } else if (pkt.payloadType() == 97) {
-            // 音频流（PT=97）：RTP包 → JitterBuffer → 解包 → Opus解码 → 播放
-            audioJitterBuf.insert(pkt);                    // 送入音频抖动缓冲区
+            // 音频只做统计（不做 NACK：重传到达已错过播放时刻，
+            // Opus 自带 PLC 丢包隐藏更划算）
+            audioRecvReport.onPacketReceived(pkt.ssrc(), pkt.sequenceNumber(),
+                                             pkt.timestamp(), crystal::nowNtp());
             auto packets = audioJitterBuf.consume();       // 获取有序的 RTP 包
             for (const auto& p : packets) {
                 auto frames = depacketizer.depacketizeOpus(p);  // RTP 解包为 Opus 帧
@@ -213,6 +292,47 @@ int main(int argc, char* argv[]) {
                 }
             }
         }
+    });
+
+    // ---- 回调1b：接收远端 RTCP 复合包（传输层去复用后到达这里）----
+    // NACK → 补发 | PLI → 强制关键帧 | RR → RTT | SR → LSR 基准
+    pc->onRtcp([&](const std::vector<uint8_t>& data) {
+        crystal::parseRtcpCompound(data.data(), data.size(),
+                                   [&](const crystal::RtcpPacket& p) {
+            switch (p.kind) {
+            case crystal::RtcpKind::Nack:
+                // 对端请求重传：展开 PID+BLP 为 seq，逐个从重传缓冲补发
+                for (uint16_t seq : crystal::NackPacket::expandEntries(p.nack.entries)) {
+                    auto original = retxBuffer.get(seq, nowMs());
+                    if (!original.empty()) {
+                        pc->sendMedia(original);  // 原样补发缓存的 RTP bytes
+                    }
+                }
+                break;
+            case crystal::RtcpKind::Pli:
+                // 对端画面不可恢复，下一帧强制 IDR
+                encoder.forceKeyframe();
+                crystal::Logger::info("RTCP: PLI received, forcing keyframe");
+                break;
+            case crystal::RtcpKind::ReceiverReport: {
+                // 对端 RR → 更新我方两条发送流的 RTT/对端观测丢包率
+                // （reporter 内部按 SSRC 匹配，各取所需）
+                uint64_t ntp = crystal::nowNtp();
+                videoSendReport.onReceiverReport(p.rr, ntp);
+                audioSendReport.onReceiverReport(p.rr, ntp);
+                break;
+            }
+            case crystal::RtcpKind::SenderReport: {
+                // 对端 SR → 记录到达时刻（我方 RR 报告块 LSR/DLSR 基准）
+                uint64_t ntp = crystal::nowNtp();
+                videoRecvReport.onSenderReport(p.sr.ssrc, ntp);
+                audioRecvReport.onSenderReport(p.sr.ssrc, ntp);
+                break;
+            }
+            default:
+                break;  // SDES 等本阶段不处理
+            }
+        });
     });
 
     // ---- 回调2：ICE Candidate 发现 ----
@@ -229,35 +349,52 @@ int main(int argc, char* argv[]) {
         renderer.render(yuvData, width, height);
     });
 
+    // ---- 回调3b：解码错误 → 节流后请求关键帧 ----
+    // sendPli 内部 500ms 节流；错误隐藏帧（花屏）同样触发
+    decoder.onError([&]() { sendPli(); });
+
     // ---- 回调4：视频编码输出 → RTP 打包 → 发送 ----
     // 编码器每输出一个 NAL Unit，打包为 RTP 包并通过 PeerConnection 发送
-    // 数据流：NAL → [RtpPacketizer] → RTP包 → [PeerConnection] → 网络
+    // 同一帧的多个 NAL 共享同一 RTP 时间戳（videoRtpTs 在回调5按帧推进）
     encoder.onEncoded([&](const uint8_t* nalData, size_t nalLen) {
         std::vector<uint8_t> nal(nalData, nalData + nalLen);
-        auto packets = videoPacketizer.packetizeH264(nal, 0);  // 打包为 RTP（大 NAL 自动 FU-A 分片）
+        auto packets = videoPacketizer.packetizeH264(nal, videoRtpTs);  // 大 NAL 自动 FU-A 分片
         for (const auto& pkt : packets) {
             auto data = pkt.serialize();           // 序列化为字节流
+            // ① 存入重传缓冲（对端 NACK 时按 seq 补发的就是这份 bytes）
+            retxBuffer.store(pkt.sequenceNumber(), data, nowMs());
+            // ② 发送侧统计（SR 的包数/字节数/最新时间戳）
+            videoSendReport.onPacketSent(pkt.sequenceNumber(),
+                                         pkt.payload().size(), pkt.timestamp());
+            // ③ 实际发送
             pc->sendMedia(data);                   // 通过 P2P 连接发送
+            videoSent = true;
         }
     });
 
     // ---- 回调5：视频采集 → 编码 ----
     // 摄像头每采集一帧 YUV 数据，送入编码器
-    // 数据流：摄像头 → [V4L2Capture] → YUV帧 → [H264Encoder] → NAL Unit
+    // 【RTP 时间戳】Phase 1 所有包 timestamp=0，接收端无法判断帧边界，
+    // 也会破坏抖动计算。视频时钟 90kHz，每帧推进 90000/fps。
     capture.onFrame([&](const uint8_t* yuvData, size_t len) {
-        encoder.encode(yuvData, len);
+        videoRtpTs += 90000 / encConfig.fps;  // 一帧周期（30fps → 3000）
+        encoder.encode(yuvData, len);         // encode 同步触发回调4
     });
 
     // ---- 回调6：音频采集 → 编码 → RTP 打包 → 发送 ----
     // 麦克风采集 PCM 数据，编码为 Opus，打包为 RTP 包并发送
-    // 数据流：麦克风 → [AlsaCapture] → PCM → [OpusEncoder] → Opus帧 → [RtpPacketizer] → RTP包 → 网络
+    // 音频时钟 48kHz，每帧推进 = 每帧采样数（Opus @48kHz）
     alsaCapture.onAudio([&](const int16_t* data, size_t samples) {
         auto opusFrame = opusEncoder.encode(data, opusEncoder.frameSize());  // PCM → Opus
         if (!opusFrame.empty()) {
-            auto packets = audioPacketizer.packetizeOpus(opusFrame, 0);  // Opus → RTP 包
+            audioRtpTs += static_cast<uint32_t>(opusEncoder.frameSize());
+            auto packets = audioPacketizer.packetizeOpus(opusFrame, audioRtpTs);  // Opus → RTP 包
             for (const auto& pkt : packets) {
                 auto data = pkt.serialize();           // 序列化为字节流
+                audioSendReport.onPacketSent(pkt.sequenceNumber(),
+                                             pkt.payload().size(), pkt.timestamp());
                 pc->sendMedia(data);                   // 通过 P2P 连接发送
+                audioSent = true;
             }
         }
     });
@@ -353,10 +490,78 @@ int main(int argc, char* argv[]) {
 
     // ====================================================================
     // 步骤10：主循环
-    // 轮询 SDL 事件（窗口关闭等），同时等待退出信号
+    // 轮询 SDL 事件 + 驱动 RTCP 周期任务（NACK 重试 / SR-RR / 统计）
     // ====================================================================
+    uint64_t lastReportMs = 0;
+    uint64_t lastGivenUp = 0;
     while (g_running && !renderer.shouldQuit()) {
         renderer.pollEvents();  // 处理 SDL 窗口事件
+        uint64_t now = nowMs();
+
+        // --- NACK 重试驱动：到期未恢复的 seq 再次请求 ---
+        sendNack(nackRequester.tick(now));
+
+        // --- 重试耗尽 → PLI 兜底（参考帧链已断，重传救不回来）---
+        if (nackRequester.givenUpCount() > lastGivenUp) {
+            lastGivenUp = nackRequester.givenUpCount();
+            sendPli();
+        }
+
+        // --- 每 5s：SR/RR + 统计行（RFC 3550 推荐周期）---
+        if (now - lastReportMs >= 5000) {
+            lastReportMs = now;
+            uint64_t ntp = crystal::nowNtp();
+
+            // 视频流：发过包 → SR(内嵌对端接收报告块)；只收未发 → 纯 RR
+            crystal::ReportBlock blk;
+            std::vector<crystal::ReportBlock> blocks;
+            if (videoRecvReport.buildBlock(ntp, blk)) blocks.push_back(blk);
+            if (videoSent) {
+                pc->sendRtcp(videoSendReport.buildReport(ntp, blocks));
+            } else if (!blocks.empty()) {
+                crystal::ReceiverReport rr;
+                rr.ssrc = videoSsrc;      // 报告发起方 SSRC
+                rr.blocks = blocks;
+                std::vector<uint8_t> buf;
+                crystal::appendReceiverReport(buf, rr);
+                crystal::SdesPacket sdes;
+                sdes.ssrc = videoSsrc;
+                sdes.cname = "crystal-video";
+                crystal::appendSdes(buf, sdes);   // 复合包需含 SDES
+                pc->sendRtcp(buf);
+            }
+            // 音频流：同理
+            blocks.clear();
+            if (audioRecvReport.buildBlock(ntp, blk)) blocks.push_back(blk);
+            if (audioSent) {
+                pc->sendRtcp(audioSendReport.buildReport(ntp, blocks));
+            } else if (!blocks.empty()) {
+                crystal::ReceiverReport rr;
+                rr.ssrc = audioSsrc;
+                rr.blocks = blocks;
+                std::vector<uint8_t> buf;
+                crystal::appendReceiverReport(buf, rr);
+                crystal::SdesPacket sdes;
+                sdes.ssrc = audioSsrc;
+                sdes.cname = "crystal-audio";
+                crystal::appendSdes(buf, sdes);
+                pc->sendRtcp(buf);
+            }
+
+            // --- 终端质量统计行 ---
+            std::string rtt = videoSendReport.hasRtt()
+                                  ? std::to_string(
+                                        static_cast<int>(videoSendReport.rttMs()))
+                                  : "n/a";
+            crystal::Logger::info(
+                "[stats] 丢包 v{:.1f}% a{:.1f}% | 抖动 v{:.1f}ms a{:.1f}ms | "
+                "RTT {}ms | 重传 {} miss {} | NACK {} 放弃 {}",
+                videoRecvReport.lossRate() * 100, audioRecvReport.lossRate() * 100,
+                videoRecvReport.jitterMs(), audioRecvReport.jitterMs(), rtt,
+                retxBuffer.retransmittedCount(), retxBuffer.missCount(),
+                nackRequester.requestedCount(), nackRequester.givenUpCount());
+        }
+
         std::this_thread::sleep_for(std::chrono::milliseconds(16));  // ~60fps 轮询
     }
 
