@@ -105,6 +105,8 @@ src/media/rtcp/                        ← 新模块，与 src/media/rtp/ 平级
   - 未恢复的 seq 重试，上限 3 次，间隔 33ms（约一个视频帧周期）
   - 超过上限放弃（大概率真丢包，交给 PLI 兜底恢复画面）
 - 输出：到期需要请求的 seq 集合，由上层合成为 NACK 报文发送
+- 驱动方式：新间隙由 `insert()` 调用时同步上报；重试到期由上层周期驱动
+  （`main_client` 的接收循环中每帧处理时调用 `tick(now)`，取出到期 seq）
 
 ### 3.4 统计 `RtcpReporter`
 
@@ -169,7 +171,7 @@ PLI 触发源：解码错误（节流 500ms）。
 
 ## 6. 测试策略
 
-新增测试文件（接入现有 `crystal_rtp_tests` 或独立 `crystal_rtcp_tests` 目标）：
+新增测试文件（独立 `crystal_rtcp_tests` 可执行目标，链接 `crystal_media_rtcp`）：
 
 | 文件 | 覆盖 |
 |------|------|
