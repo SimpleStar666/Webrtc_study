@@ -295,7 +295,18 @@ int main(int argc, char* argv[]) {
     });
 
     // ---- 回调1b：接收远端 RTCP 复合包（传输层去复用后到达这里）----
-    // NACK → 补发 | PLI → 强制关键帧 | RR → RTT | SR → LSR 基准
+    //
+    // 【数据流全景】PeerConnection 收到 UDP 载荷后先"验第二字节"分流：
+    //
+    //   网络字节 → isRtcpPacket()？
+    //                ├─ 否(96/97 等) → RTP → 回调1(onTrack)：媒体处理
+    //                └─ 是(192-223)  → RTCP → 本回调(onRtcp)：反馈处理
+    //
+    // 【本回调处理四种反馈（对应四种 RTCP 包类型）】
+    //   NACK → 补发：对端点名丢失的 seq，从重传缓冲取原包重发
+    //   PLI  → 关键帧：对端解码崩了，我方下一帧强制 IDR
+    //   RR   → RTT：对端报告"我发得怎么样"，算往返延迟
+    //   SR   → LSR 基准：记下对端 SR 到达时刻，供我方 RR 回显用
     pc->onRtcp([&](const std::vector<uint8_t>& data) {
         crystal::parseRtcpCompound(data.data(), data.size(),
                                    [&](const crystal::RtcpPacket& p) {
@@ -508,6 +519,11 @@ int main(int argc, char* argv[]) {
         }
 
         // --- 每 5s：SR/RR + 统计行（RFC 3550 推荐周期）---
+        //
+        // 【发 SR 还是发 RR？规则很简单（RFC 3550 6.4）】
+        //   本流"发过"媒体包 → SR（SR 自带报告块，还能捎带接收统计）
+        //   本流"只收没发"   → 纯 RR（没有发送计数可报告）
+        //   正常通话双方都发过包，所以走 SR 分支是常态
         if (now - lastReportMs >= 5000) {
             lastReportMs = now;
             uint64_t ntp = crystal::nowNtp();
@@ -549,6 +565,12 @@ int main(int argc, char* argv[]) {
             }
 
             // --- 终端质量统计行 ---
+            // 【字段 ↔ 数据源对照】（详细说明见 docs/USAGE.md）
+            //   丢包 v/a   ← video/audioRecvReport.lossRate()（RR 同源数据）
+            //   抖动 v/a   ← RecvSideReporter.jitterMs()（RFC 3550 A.8 平滑值）
+            //   RTT        ← videoSendReport.rttMs()（LSR/DLSR 法，发 SR ≥1 次后才有值）
+            //   重传/miss  ← RetransmissionBuffer（我方响应 NACK 的补发/未命中）
+            //   NACK/放弃  ← NackRequester（我方发出的请求/重试耗尽数）
             std::string rtt = videoSendReport.hasRtt()
                                   ? std::to_string(
                                         static_cast<int>(videoSendReport.rttMs()))
