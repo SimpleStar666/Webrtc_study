@@ -27,10 +27,12 @@ TwccRecorder::TwccRecorder(uint32_t senderSsrc, uint32_t mediaSsrc)
     : senderSsrc_(senderSsrc), mediaSsrc_(mediaSsrc) {}
 
 void TwccRecorder::setMediaSsrc(uint32_t ssrc) {
+    std::lock_guard<std::mutex> lock(mutex_);
     mediaSsrc_ = ssrc;
 }
 
 void TwccRecorder::onPacket(uint16_t twccSeq, double arrivalMs) {
+    std::lock_guard<std::mutex> lock(mutex_);
     // 会话时钟原点只在首个历史包时设定
     if (!hasEpoch_) {
         epochBaseMs_ = arrivalMs;
@@ -52,6 +54,7 @@ void TwccRecorder::onPacket(uint16_t twccSeq, double arrivalMs) {
 }
 
 bool TwccRecorder::buildFeedback(double nowMs, TwccFeedback& out) {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (pending_.empty()) return false;
 
     // 窗口判定：时长够 或 积压够

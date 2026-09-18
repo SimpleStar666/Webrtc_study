@@ -11,12 +11,19 @@
 //   2. 时间（默认 3 秒）：重传请求若晚于包的"保鲜期"（RTT + 重试窗口），
 //      补发已无意义（接收端早已放弃该包），直接计 miss
 //
+// 【数据结构——哈希索引 + 淘汰队列（工程化升级 v2 新增）】
+//   entries_  : unordered_map<seq, Entry> —— get() O(1) 命中
+//   order_    : deque<seq>（插入序 ≈ 序列号递增序）——淘汰从队首出
+//   单独的 map 或 deque 都不够：map 无淘汰序，deque 查找 O(n)。
+//   两者配合：淘汰时从 order_ 拿 seq，再从 entries_ erase。
+//
 // 【为什么不用 RTX（RFC 4588）】
 // RTX 用专用 SSRC + 原始序列号重传，需要额外协商。P2P 学习项目直接
 // 原样补发即可，序列号不变，接收端 JitterBuffer 无感知。
 //
 // 【线程模型】
 // store() 在采集编码线程调用；get() 在 RTCP 接收线程调用 → 内部加锁。
+//
 // ============================================================================
 
 #pragma once
@@ -24,6 +31,7 @@
 #include <cstdint>
 #include <deque>
 #include <mutex>
+#include <unordered_map>
 #include <vector>
 
 namespace crystal {
@@ -47,7 +55,6 @@ public:
 
 private:
     struct Entry {
-        uint16_t seq;
         uint64_t tsMs;              // 存储时刻（用于 TTL 淘汰）
         std::vector<uint8_t> data;  // 原始 RTP 字节
     };
@@ -56,7 +63,8 @@ private:
     void evictLocked(uint64_t nowMs);
 
     mutable std::mutex mutex_;
-    std::deque<Entry> entries_;  // 按插入序（≈序列号递增序）
+    std::unordered_map<uint16_t, Entry> entries_;  // seq → 包数据，O(1) 查找
+    std::deque<uint16_t> order_;                  // 插入序 seq，淘汰用
     size_t capacity_;
     uint64_t ttlMs_;
     uint64_t retransmitted_ = 0;

@@ -37,6 +37,7 @@ GccController::GccController(uint32_t initKbps)
 // 丢包通道（硬规则，立即生效）
 // ============================================================================
 void GccController::onLossUpdate(double lossRate) {
+    std::lock_guard<std::mutex> lock(mutex_);
     lastLoss_ = lossRate;
     if (lossRate > kLossHigh) {
         applyDecrease();        // >10%：强降（网络已在丢，硬通道让路）
@@ -51,6 +52,7 @@ void GccController::onLossUpdate(double lossRate) {
 // 趋势通道（喂 trendline）
 // ============================================================================
 void GccController::onFeedback(const FeedbackSample& s) {
+    std::lock_guard<std::mutex> lock(mutex_);
     size_t n = std::min(s.arrivals.size(), s.owdMs.size());
     for (size_t i = 0; i < n; ++i) {
         double owd = s.owdMs[i];
@@ -67,6 +69,7 @@ void GccController::onFeedback(const FeedbackSample& s) {
 // 周期 tick：过载状态机 + AIMD 增长
 // ============================================================================
 void GccController::tick() {
+    std::lock_guard<std::mutex> lock(mutex_);
     bool reduced = false;
 
     if (trendline_.ready()) {
@@ -92,6 +95,19 @@ void GccController::tick() {
         applyIncrease();
     }
     clamp();
+}
+
+// ============================================================================
+// 查询（任意线程）
+// ============================================================================
+uint32_t GccController::targetBitrateKbps() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return targetKbps_;
+}
+
+double GccController::trendSlope() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return trendline_.ready() ? trendline_.slope() : 0.0;
 }
 
 // ============================================================================

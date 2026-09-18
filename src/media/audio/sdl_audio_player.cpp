@@ -12,9 +12,9 @@
 //
 // 【关键注意事项】
 // - SDL 回调函数在 SDL 内部音频线程中执行，不是主线程
-// - 回调函数必须尽快返回，不能执行阻塞操作（如文件 I/O、网络请求）
+// - 回调函数必须尽快返回，不能执行阻塞操作（如文件 I/O、网络请求、抢锁）
 // - 回调函数中不能调用 SDL_Quit 或 SDL_CloseAudio
-// - 必须使用互斥锁保护回调函数与主线程共享的数据
+// - v2 起回调路径完全无锁（SPSC 环形缓冲），不持有任何锁
 // ===================================================================================
 
 #include "media/audio/sdl_audio_player.h"
@@ -24,9 +24,11 @@
 
 namespace crystal {
 
-// 构造函数 - 保存音频参数
+// 构造函数 - 保存音频参数并按 0.5s 容量初始化环形缓冲
+// （容量换算：采样率 × 声道数 × 0.5 秒；48kHz 单声道 = 24000 个 int16）
 SDLAudioPlayer::SDLAudioPlayer(int sampleRate, int channels)
-    : sampleRate_(sampleRate), channels_(channels) {}
+    : sampleRate_(sampleRate), channels_(channels),
+      ring_(static_cast<size_t>(sampleRate) * channels / 2) {}
 
 // 析构函数 - 自动停止播放
 SDLAudioPlayer::~SDLAudioPlayer() {
@@ -60,7 +62,7 @@ bool SDLAudioPlayer::init() {
     // 声道数设置
     // 1 = 单声道（语音通话默认）
     // 2 = 立体声
-    spec.channels = channels_;
+    spec.channels = static_cast<Uint8>(channels_);
 
     // 缓冲区大小（单位：采样点数 × 声道数）
     // 这个值决定了 SDL 每次回调请求的数据量：
@@ -99,23 +101,17 @@ bool SDLAudioPlayer::init() {
     // 这给了应用层在开始播放前预填充缓冲区的机会
     SDL_PauseAudio(0);
 
-    Logger::info("SDL audio player initialized: {}Hz {}ch", sampleRate_, channels_);
+    Logger::info("SDL audio player initialized: {}Hz {}ch (lock-free SPSC, capacity {}ms)",
+                 sampleRate_, channels_, ring_.capacity() / channels_ * 1000 / sampleRate_);
     return true;
 }
 
-// play - 将 PCM 音频数据送入播放队列
-// 此函数由解码线程调用（生产者），将解码后的 PCM 数据追加到缓冲队列
+// play - 将 PCM 音频数据送入播放缓冲（解码线程调用，生产者）
+// 无锁写入环形缓冲；缓冲满时放不下的最新数据被丢弃（计入
+// pushDropCount，可用 overflowCount() 观测）——宁可爆音一瞬也不
+// 阻塞解码线程、不让延迟爬升。
 void SDLAudioPlayer::play(const int16_t* data, size_t samples) {
-    // 加锁保护队列操作
-    // lock_guard 在作用域结束时自动释放锁（RAII）
-    std::lock_guard<std::mutex> lock(mutex_);
-
-    // 将所有采样点逐个入队
-    // 注意：samples × channels_ 是总采样点数（包含所有声道）
-    // 对于交错排列的数据：[L0, R0, L1, R1, ...]，每个元素作为一个 int16_t 入队
-    for (size_t i = 0; i < samples * channels_; i++) {
-        buffer_.push(data[i]);
-    }
+    ring_.push(data, samples * channels_);
 }
 
 // stop - 停止播放并关闭 SDL 音频设备
@@ -139,11 +135,13 @@ void SDLAudioPlayer::audioCallback(void* userdata, uint8_t* stream, int len) {
     self->fillBuffer(stream, len);
 }
 
-// fillBuffer - 填充 SDL 请求的音频数据
-// 从内部缓冲队列取出数据填充到 SDL 的输出缓冲区
+// fillBuffer - 填充 SDL 请求的音频数据（SDL 音频线程调用，消费者）
+// 从环形缓冲读出数据填充到 SDL 的输出缓冲区
+// 三个职责，全程无锁：
+//   1. 水位回落：超 320ms → 丢最旧回到 160ms（延迟不爬升）
+//   2. 正常消费：pop 出本次回调需要的采样数
+//   3. 下溢兜底：不足部分填静音（0），并计一次下溢
 void SDLAudioPlayer::fillBuffer(uint8_t* stream, int len) {
-    std::lock_guard<std::mutex> lock(mutex_);
-
     // 将字节流缓冲区转换为 int16_t 指针
     // SDL 传递的 stream 是 uint8_t* 字节流，但实际数据格式是 int16_t
     // reinterpret_cast 进行类型转换，不改变底层数据
@@ -152,25 +150,55 @@ void SDLAudioPlayer::fillBuffer(uint8_t* stream, int len) {
     // 计算需要填充的采样点数
     // len 是字节数，每个 int16_t 占 2 字节
     // 例如：len=1920 字节 → 960 个采样点（48kHz 单声道 20ms）
-    int samples = len / 2;
+    size_t samples = static_cast<size_t>(len) / 2;
 
-    for (int i = 0; i < samples; i++) {
-        if (!buffer_.empty()) {
-            // 从队列头部取出一个采样点
-            out[i] = buffer_.front();
-            buffer_.pop();
-        } else {
-            // 队列为空，用静音（0）填充
-            // 静音填充是音频播放的标准做法：
-            //   - 避免播放未初始化的内存数据（会产生噪声）
-            //   - 保持音频流的连续性，避免设备状态异常
-            // 队列空说明数据供给不足（underrun），可能原因：
-            //   - 网络延迟导致解码数据未及时到达
-            //   - 解码速度跟不上播放速度
-            //   - Jitter Buffer 中的数据已耗尽
-            out[i] = 0;
-        }
+    // ---- 1. 水位回落（丢最旧，消费者侧执行才安全）----
+    // 缓冲水位超过 kCatchUpMs 说明生产持续快于消费（时钟漂移/解码
+    // 过快）。丢最旧直接跳到 kTargetMs 水位：听感上是跳过一小段，
+    // 但延迟立刻收敛回来——实时通话低延迟优先于连续性。
+    size_t bufferedSamples = ring_.size();
+    size_t catchUpSamples = kCatchUpMs * sampleRate_ / 1000 * channels_;
+    size_t targetSamples = kTargetMs * sampleRate_ / 1000 * channels_;
+    if (bufferedSamples > catchUpSamples) {
+        ring_.drop(bufferedSamples - targetSamples);
     }
+
+    // ---- 2. 正常消费：pop 本次回调需要的数据 ----
+    size_t got = ring_.pop(out, samples);
+
+    // ---- 3. 下溢兜底：不足部分填静音 ----
+    // 静音填充是音频播放的标准做法：
+    //   - 避免播放未初始化的内存数据（会产生噪声）
+    //   - 保持音频流的连续性，避免设备状态异常
+    // 下溢说明数据供给不足（网络延迟/解码跟不上/JitterBuffer 耗尽），
+    // 计数供指标上报定位问题
+    if (got < samples) {
+        std::memset(out + got, 0, (samples - got) * sizeof(int16_t));
+        underflowCount_.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+// ---- 观测接口（工程化升级 v2 新增）----
+
+// 当前缓冲水位（毫秒）：样本数 → 毫秒
+size_t SDLAudioPlayer::bufferedMs() const {
+    return ring_.size() * 1000 / (static_cast<size_t>(sampleRate_) * channels_);
+}
+
+// 下溢次数：用静音填过多少次回调
+uint64_t SDLAudioPlayer::underflowCount() const {
+    return underflowCount_.load(std::memory_order_relaxed);
+}
+
+// 溢出次数：缓冲满导致 play() 丢弃最新数据的次数
+uint64_t SDLAudioPlayer::overflowCount() const {
+    return ring_.pushDropCount();
+}
+
+// 消费侧丢弃累计（采样毫秒数）：水位回落策略丢掉的时长
+uint64_t SDLAudioPlayer::droppedMs() const {
+    return ring_.consumerDropCount() * 1000 /
+           (static_cast<size_t>(sampleRate_) * channels_);
 }
 
 } // namespace crystal

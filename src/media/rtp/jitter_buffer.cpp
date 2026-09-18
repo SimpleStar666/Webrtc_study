@@ -93,6 +93,25 @@ std::vector<uint16_t> JitterBuffer::insert(const RtpPacket& pkt) {
     receivedCount_++;
 
     // ========================================================================
+    // 自适应生效延迟状态更新（工程化升级 v2 新增）
+    //
+    // 1. 包间隔 EMA：相邻两次到达的时间差。同帧多个分片常在同一毫秒
+    //    到达（delta=0 没信息量，跳过）；上限 500ms 防时钟跳变污染。
+    //    增益 1/4：与 RFC 3550 抖动估计同量级的平滑速度。
+    // 2. 乱序深度 EMA：迟到包的序号跨度（span = expected - seq）。
+    //    在序包贡献 0 → 深度指数衰减；乱序越频繁越深，生效延迟越高。
+    // ========================================================================
+    if (pkt.arrivalMs() > lastArrivalMs_ && hasLastArrival_) {
+        double delta = static_cast<double>(pkt.arrivalMs() - lastArrivalMs_);
+        if (delta > 500.0) delta = 500.0;
+        interArrivalMs_ += (delta - interArrivalMs_) * 0.25;
+    }
+    if (pkt.arrivalMs() >= lastArrivalMs_ || !hasLastArrival_) {
+        lastArrivalMs_ = pkt.arrivalMs();
+        hasLastArrival_ = true;
+    }
+
+    // ========================================================================
     // 第一个包的特殊处理
     // 同时初始化两个序列号指针：
     //   expectedSeq_   = seq + 1（下一个期望从网络收到的序列号）
@@ -103,6 +122,7 @@ std::vector<uint16_t> JitterBuffer::insert(const RtpPacket& pkt) {
         nextOutputSeq_ = pkt.sequenceNumber();
         firstPacket_ = false;
         buffer_[pkt.sequenceNumber()] = pkt;
+        reorderDepth_ *= 0.75;   // 在序（首个包视为在序），乱序深度衰减
         Logger::debug("JitterBuffer: first packet seq={}", pkt.sequenceNumber());
         return missing;
     }
@@ -114,6 +134,10 @@ std::vector<uint16_t> JitterBuffer::insert(const RtpPacket& pkt) {
     // 使用 expectedSeq_（丢包检测指针），而非 nextOutputSeq_
     // ========================================================================
     int16_t diff = static_cast<int16_t>(seq - expectedSeq_);
+
+    // 乱序深度 EMA：在序包 span=0（衰减），迟到包 span=-diff（加深）
+    double span = diff < 0 ? -static_cast<double>(diff) : 0.0;
+    reorderDepth_ += (span - reorderDepth_) * 0.25;
 
     if (diff == 0) {
         // ====================================================================
@@ -164,7 +188,7 @@ std::vector<uint16_t> JitterBuffer::insert(const RtpPacket& pkt) {
 }
 
 // ============================================================================
-// consume - 从缓冲区消费可输出的 RTP 包
+// consume - 从缓冲区消费可输出的 RTP 包（旧版序号启发式 + 时间驱动）
 // ============================================================================
 //
 // 【算法流程】
@@ -174,18 +198,30 @@ std::vector<uint16_t> JitterBuffer::insert(const RtpPacket& pkt) {
 //    - 说明这个包已经"到期"（可能是之前期望的包，或迟到的包）
 //    - 直接输出，更新 nextOutputSeq_ = seq + 1
 //
-// 2. 0 < diff <= 3: 包的序列号略大于期望输出值，间隙在 1-3 个包以内
-//    - 判定为丢包，不再等待缺失的包
-//    - 更新 nextOutputSeq_ = seq + 1，输出当前包
+// 2. diff > 0（有缺口）——两种模式分叉：
+//    旧版 consume()（nowMs == 0）：
+//      - diff <= 3: 小间隙判定丢包，立即越过输出
+//      - diff > 3 : 大间隙无限等待（缺陷：真丢包时延迟无界）
+//    时间驱动 consume(nowMs)（工程化升级 v2）：
+//      - 距队首包到达已等待 ≥ effectiveDelayMs() → 缺口判丢，越过输出
+//      - 等待不足 → 停止消费（迟到包可能马上到，等它值得）
 //
-// 3. diff > 3: 间隙较大（缺失超过 3 个包）
-//    - 可能这些包还在路上（网络延迟较大但未丢包）
-//    - 跳过，等待后续 insert 后再处理
+// 【越过缺口的手法】nextOutputSeq_ = seq 后 continue 重评估：
+//   下一轮 diff = seq - nextOutputSeq_ = 0 → 走"已到期"路径输出。
+//   这样越过逻辑只有一处赋值，不会重复。
 //
 // 【关键：使用 nextOutputSeq_ 而非 expectedSeq_】
 // nextOutputSeq_ 是 consume() 独占的输出指针，不会被 insert() 修改，
 // 也不会因为回退而影响 insert() 的丢包检测。
 std::vector<RtpPacket> JitterBuffer::consume() {
+    return consumeImpl(0);
+}
+
+std::vector<RtpPacket> JitterBuffer::consume(uint64_t nowMs) {
+    return consumeImpl(nowMs);
+}
+
+std::vector<RtpPacket> JitterBuffer::consumeImpl(uint64_t nowMs) {
     std::vector<RtpPacket> result;
 
     // 缓冲区为空，直接返回
@@ -207,25 +243,56 @@ std::vector<RtpPacket> JitterBuffer::consume() {
             result.push_back(it->second);
             nextOutputSeq_ = seq + 1;
             it = buffer_.erase(it);
-        } else if (diff <= 3) {
-            // ==================================================================
-            // 间隙较小（1-3个包），判定为丢包，不再等待
-            // 跳过缺失的包，输出当前包
-            // ==================================================================
-            nextOutputSeq_ = seq;
-            result.push_back(it->second);
-            nextOutputSeq_ = seq + 1;
-            it = buffer_.erase(it);
-        } else {
-            // ==================================================================
-            // 间隙较大（>3个包），可能包还在路上
-            // 跳过，等待后续包到达后再处理
-            // ==================================================================
-            ++it;
+            continue;
         }
+
+        // ==================================================================
+        // 有缺口（seq > nextOutputSeq_）——判断是否越过
+        // ==================================================================
+        bool crossGap;
+        if (nowMs != 0) {
+            // 时间驱动（v2）：距队首包到达已等待 ≥ 生效延迟 → 越过
+            // 队首包即 it（map 按 seq 排序，第一个越过 nextOutputSeq_ 的包）
+            uint64_t waited =
+                nowMs > it->second.arrivalMs() ? nowMs - it->second.arrivalMs() : 0;
+            crossGap = waited >= effectiveDelayMs();
+        } else {
+            // 旧版启发式：小间隙（≤3）立即越过，大间隙等待
+            crossGap = diff <= 3;
+        }
+
+        if (crossGap) {
+            // 越过缺口：输出指针直接跳到当前包（缺失的 seq 判定为丢包）
+            nextOutputSeq_ = seq;
+            // 不 erase，continue 后 diff==0 走"已到期"路径输出
+            continue;
+        }
+
+        // 等待：队首包还没等够，后面的包更不该出——直接停止
+        break;
     }
 
     return result;
+}
+
+// ============================================================================
+// effectiveDelayMs - 当前生效延迟（工程化升级 v2 新增）
+// ============================================================================
+//
+// 生效延迟 = clamp(基础延迟 + 乱序深度 × 包间隔, 基础延迟, 上限)
+//
+// · 乱序深度×包间隔 ≈ "为一个迟到的包多等多久的合理时长"：
+//   迟到包落后 d 个序号，它大约晚 d×包间隔 发出/到达
+// · 网络平稳时深度→0，生效延迟收敛回基础延迟（默认 40ms）
+// · 上限 max(基础延迟, 200)：乱序再严重也不无限加深（NetEq 同思路）
+uint32_t JitterBuffer::effectiveDelayMs() const {
+    double d = targetDelayMs_ + reorderDepth_ * interArrivalMs_;
+    double lo = targetDelayMs_;
+    double hi = targetDelayMs_ > kMaxEffectiveDelayMs ? targetDelayMs_
+                                                      : kMaxEffectiveDelayMs;
+    if (d < lo) d = lo;
+    if (d > hi) d = hi;
+    return static_cast<uint32_t>(d + 0.5);
 }
 
 // ============================================================================

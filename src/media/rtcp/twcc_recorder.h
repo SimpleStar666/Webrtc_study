@@ -19,11 +19,16 @@
 // libwebrtc 同量级：太短则反馈包自身成为带宽开销，太长则拥塞响应迟钝。
 // 100ms 足以覆盖几十个视频包（30fps × FU-A 分片），又把控制回路延迟
 // 压在一两个帧间隔内。
+//
+//【线程模型（工程化升级 v2：三级解耦后）】
+// onPacket/setMediaSsrc 在 RTP 接收线程调用，buildFeedback 在主循环调用
+// ——内部一把 mutex 保护 pending_ 窗口。每包一次锁（事件率低），可接受。
 #pragma once
 
 #include "media/rtcp/transport_feedback.h"
 #include <cstdint>
 #include <map>
+#include <mutex>
 
 namespace crystal {
 
@@ -45,6 +50,7 @@ public:
     bool buildFeedback(double nowMs, TwccFeedback& out);
 
 private:
+    mutable std::mutex mutex_;     // RTP 接收线程 onPacket vs 主循环 buildFeedback
     uint32_t senderSsrc_;
     uint32_t mediaSsrc_;
 

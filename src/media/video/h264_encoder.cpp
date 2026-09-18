@@ -251,9 +251,8 @@ void H264Encoder::encode(const uint8_t* yuvData, size_t len) {
     // 的 forced-idr 选项由 libx264 编为 IDR
     // 注意：frame_ 是复用对象，必须每帧重置，否则标志消费一次后会
     // 永久保持 I 帧（每帧都是关键帧，码率暴涨）
-    if (forceKeyframe_) {
+    if (forceKeyframe_.exchange(false)) {  // 原子消费（RTCP 线程可能并发置位）
         frame_->pict_type = AV_PICTURE_TYPE_I;
-        forceKeyframe_ = false;
         Logger::info("Encoder: forcing keyframe (PLI response)");
     } else {
         frame_->pict_type = AV_PICTURE_TYPE_NONE;  // 交回编码器按 GOP 决定
@@ -348,7 +347,7 @@ void H264Encoder::onEncoded(EncodedCallback cb) {
 // 直接触发一次编码）。这是"命令-检查"模式的典型用法，跨线程也安全：
 // 本端编码线程是唯一写者，标志本身是原子语义的 bool。
 void H264Encoder::forceKeyframe() {
-    forceKeyframe_ = true;
+    forceKeyframe_.store(true, std::memory_order_relaxed);  // 仅标志位，无数据依赖
 }
 
 // ============================================================================

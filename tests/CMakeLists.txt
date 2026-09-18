@@ -3,12 +3,22 @@ add_executable(crystal_rtp_tests
     rtp_packetizer_test.cpp
     rtp_depacketizer_test.cpp
     jitter_buffer_test.cpp
+    jitter_time_test.cpp
     twcc_header_test.cpp
 )
 target_link_libraries(crystal_rtp_tests PRIVATE
     crystal_media_rtp crystal_utils GTest::gtest_main
 )
 add_test(NAME crystal_rtp_tests COMMAND crystal_rtp_tests)
+
+# 无锁环形缓冲测试（工程化升级 v2 Phase D 新增）
+add_executable(crystal_thread_tests
+    spsc_ring_test.cpp
+)
+target_link_libraries(crystal_thread_tests PRIVATE
+    crystal_utils GTest::gtest_main
+)
+add_test(NAME crystal_thread_tests COMMAND crystal_thread_tests)
 
 add_executable(crystal_rtcp_tests
     rtcp_packet_test.cpp

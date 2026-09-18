@@ -180,33 +180,61 @@ CrystalRTC/
 
 | 线程                  | 谁创建           | 干什么                                            | 触发的回调                                                      |
 | ------------------- | ------------- | ---------------------------------------------- | ---------------------------------------------------------- |
-| 主线程                 | `main()`      | 主循环：SDL 事件轮询 + RTCP 周期任务（NACK 重试、每 5s 发 SR/RR） | `renderer.pollEvents()`、`nackRequester.tick()`             |
-| libdatachannel 回调线程 | 库内部           | 收到远端媒体/信令状态变化                                  | `pc_->onTrack`、`pc_->onRtcp`、`onStateChange`               |
-| V4L2 采集线程           | `V4L2Capture` | 摄像头 DQBUF 取帧                                   | `capture.onFrame` → `encoder.encode` → `encoder.onEncoded` |
-| ALSA 采集线程           | `AlsaCapture` | 麦克风 `snd_pcm_readi` 取 PCM                      | `alsaCapture.onAudio` → `opusEncoder.encode`               |
-| SDL 音频线程            | SDL 内部        | 按需"拉"PCM 播放                                    | `SDLAudioPlayer::audioCallback`（静态回调）                      |
+| 主线程                 | `main()`      | 主循环：SDL 事件轮询 + RTCP 周期任务（NACK 重试、每 5s 发 SR/RR、GCC tick） | `renderer.pollEvents()`、`nackRequester.tick()`             |
+| libdatachannel 回调线程 | 库内部           | 收到远端媒体/RTCP/信令状态变化                             | `pc_->onTrack`、`pc_->onRtcp`、`onStateChange`               |
+| V4L2 采集线程           | `V4L2Capture` | 摄像头 DQBUF 取帧，**只 memcpy 入帧队列**（Phase D）       | `capture.onFrame` → `frameQueue.pushOne`                    |
+| 编码线程（Phase D 新增）     | `main()` 手工创建 | 取最新帧 → 编码 → 打包 → 发送                          | `encoder.encode` → `onEncoded` → `sendMedia`                 |
+| ALSA 采集线程           | `AlsaCapture` | 麦克风 `snd_pcm_readi` 取 PCM，编码打包发送             | `alsaCapture.onAudio` → `opusEncoder.encode`               |
+| SDL 音频线程            | SDL 内部        | 按需"拉"PCM 播放（**无锁 SPSC 环形缓冲**，Phase D）        | `SDLAudioPlayer::audioCallback`（静态回调）                      |
+
+##### 视频发送三级解耦（Phase D 的核心改动）
+
+v1 里"采集 → 编码 → 发送"全在采集回调里串行完成，问题：一次编码耗时超过帧周期
+（33ms@30fps）时，采集线程被拖住，V4L2 内核缓冲积压，**采集延迟持续爬升**。
+Phase D 把链路拆成三级，中间用无锁队列衔接：
+
+```
+V4L2 采集线程          编码线程                     RTCP 线程
+─────────────         ─────────────────────       ─────────
+DQBUF 取帧            取最新帧（丢积压旧帧）          收 NACK
+  │                     │                        → retxBuffer.get 补发
+  └─ memcpy 入队 ──→   ├─ 应用 GCC 码率（原子读）    收 PLI
+     SpscRing 容量2     ├─ encoder.encode          → forceKeyframe（atomic）
+     满丢最旧           └─ 打包→发送→存重传缓冲
+                            ↑                        ↑
+主循环 ──── gccTargetKbps_.store() ───┘    twccSendTimes_（互斥锁保护）
+```
+
+三级各自的职责与不变量：
+
+1. **采集线程只做拷贝**：一帧 YUV 约 460KB（640×480×1.5），一次 memcpy 约 50μs，
+   采集节奏与编码速度彻底脱钩——编码再慢也拖不住摄像头。
+2. **帧队列是"最新帧信箱"**：容量 2，编码线程每次只取最新帧，积压的旧帧直接丢
+   （实时视频永远编"现在"，旧帧到端上也错过渲染时刻）。丢帧计数打进 `[stats]` 行。
+3. **编码线程独占 FFmpeg 上下文**：`encode` 和 `setBitrate` 只在这一条线程发生。
+   GCC 的码率决策在主循环，用 `std::atomic<uint32_t>` 原子交接，编码线程每帧前读取
+   ——这是"控制面决策"与"执行面应用"解耦的标准手法。
 
 **要理解的关键点：**
 
-1. **发送侧的"采集 → 编码 → 打包 → 发送"发生在采集线程里**，是串行的调用链
-   （`onFrame` 里同步调用 `encode`，`encode` 里同步触发 `onEncoded`，`onEncoded` 里
-   打包并 `sendMedia`）。这一点简化了同步问题。
-2. **接收侧发生在 libdatachannel 回调线程里**：`onTrack` 里做 JitterBuffer 插入、
-   解包、解码。
-3. **RTCP 组件内部都加了** **`std::mutex`**，原因正在于"跨线程访问"：
-   - `RetransmissionBuffer::store()` 在采集/编码线程调用（发出包后存缓存），
+1. **接收侧发生在 libdatachannel 回调线程里**：`onTrack` 里做 JitterBuffer 插入、
+   解包、解码（时间驱动 consume，见 Module 3）。
+2. **RTCP 组件内部都加了** **`std::mutex`**，原因正在于"跨线程访问"：
+   - `RetransmissionBuffer::store()` 在编码线程调用（发出包后存缓存），
      `get()` 在 RTCP 接收线程调用（对端 NACK 来了查缓存补发）——**两个不同的线程**。
    - `NackRequester::onMissing/onReceived` 在接收线程调用，`tick()` 在主线程调用。
-   - `SendSideReporter::onPacketSent` 在采集线程，`onReceiverReport` 在 RTCP 接收线程。
+   - `SendSideReporter::onPacketSent` 在编码线程，`onReceiverReport` 在 RTCP 接收线程。
+   - `GccController` 的 `onFeedback/onLossUpdate` 在 RTCP 线程，`tick()` 在主线程。
+   - `TwccRecorder` 的 `onPacket` 在接收线程，`buildFeedback` 在主线程。
      所以这些类的头文件里都能看到 `mutable std::mutex mutex_;`。如果你面试被问
-     "为什么这里要加锁"，答案就是上面这三条。
-     具体数据在哪个线程产生，可以这样记：
-   - `RetransmissionBuffer` 的内容 → 采集线程 write、RTCP 线程 read；
-   - `NackRequester` 的待请求表 → 接收线程写、主线程(`tick`)读；
-   - `RecvSideReporter` 的统计 → 接收线程写、主线程(每 5s)读；
-   - `SendSideReporter` 的 RTT → 采集线程写计数、RTCP 线程写 RTT、主线程读。
+     "为什么这里要加锁"，答案就是上面这几条。
+3. **不能加锁的地方用原子/无锁**：SDL 音频回调（实时线程，持锁 = 优先级反转）
+   用 SPSC 环形缓冲；PLI 关键帧请求（RTCP 线程写、编码线程读）用 `atomic<bool>`；
+   GCC 码率、Opus FEC 冗余度用原子交接。**什么该锁、什么该原子、什么可以无锁，
+   正是 Module 12 的主题。**
 4. **主循环用** **`sleep_for(16ms)`** **驱动**（约 60fps 轮询），负责一切"按时间触发"的活：
-   每 16ms 检查一次有无到期要重试的 NACK，每 5s 发一次 SR/RR 并打印 `[stats]` 行。
+   每 16ms 检查一次有无到期要重试的 NACK，每 100ms 一次 TWCC feedback 与 GCC tick，
+   每 5s 发一次 SR/RR 并打印 `[stats]` 行。
 
 #### 面试时如何一句话介绍项目
 
@@ -848,7 +876,7 @@ std::vector<uint16_t> JitterBuffer::insert(const RtpPacket& pkt) {
 #### consume()：有序输出（pull 驱动）
 
 ```cpp
-std::vector<RtpPacket> JitterBuffer::consume() {
+std::vector<RtpPacket> JitterBuffer::consumeImpl(uint64_t nowMs) {
     std::vector<RtpPacket> result;
     if (buffer_.empty()) return result;
 
@@ -861,31 +889,66 @@ std::vector<RtpPacket> JitterBuffer::consume() {
             result.push_back(it->second);   // 已到期/迟到，输出
             nextOutputSeq_ = seq + 1;
             it = buffer_.erase(it);
-        } else if (diff <= 3) {
-            nextOutputSeq_ = seq;           // 小间隙（1-3），判为丢包，跳过等待
-            result.push_back(it->second);
-            nextOutputSeq_ = seq + 1;
-            it = buffer_.erase(it);
-        } else {
-            ++it;                            // 大间隙，可能还在路上，等待
+            continue;
         }
+
+        // 有缺口（seq > nextOutputSeq_）——按模式判断是否越过
+        bool crossGap;
+        if (nowMs != 0) {
+            // 时间驱动：距队首包到达已等够生效延迟 → 越过（见下小节）
+            uint64_t waited =
+                nowMs > it->second.arrivalMs() ? nowMs - it->second.arrivalMs() : 0;
+            crossGap = waited >= effectiveDelayMs();
+        } else {
+            crossGap = diff <= 3;            // 旧启发式：小间隙立即越过
+        }
+        if (crossGap) {
+            nextOutputSeq_ = seq;           // 缺口判丢，跳过等待
+            continue;                       // 下一轮 diff==0 走输出路径
+        }
+        break;                              // 等待：队首没等够，后面的更不该出
     }
     return result;
 }
 ```
 
-输出策略总结：
+输出策略总结（`consume()` 无参 = 旧启发式，`consume(nowMs)` = 时间驱动）：
 
-| 条件               | 策略       | 含义                    |
-| ---------------- | -------- | --------------------- |
-| `diff <= 0`      | 立即输出     | 包已到期（或迟到），该吐了         |
-| `1 <= diff <= 3` | 跳过缺失立即输出 | 小间隙，判定为丢包，不再等         |
-| `diff > 3`       | 跳过等待     | 可能还在路上，等下一轮 insert 再看 |
+| 条件                     | 策略     | 含义                        |
+| ---------------------- | ------ | ------------------------- |
+| `diff <= 0`            | 立即输出   | 包已到期（或迟到），该吐了               |
+| 有缺口 + 小间隙（≤3）/ 等够延迟   | 跳过缺口输出 | 判定为丢包，不再等                 |
+| 有缺口 + 大间隙且未等够（时间驱动）   | 停止消费   | 迟到包可能马上到，等它值得（有上界，见下小节）    |
 
-关于 `consume()` 的准确理解：它是**由上层 pull 驱动**的（每次收到新包或轮询时调用一次）。
-构造函数虽然有 `targetDelayMs`（默认 40ms），但当前实现**只是存储了这个值，并没有用它做
-"基于时间的延迟释放"**——所以它还不是真正按时间排程的生产级 Jitter Buffer，这可以作为
-后面的进阶练习。
+关于 `consume()` 的准确理解：它是**由上层 pull 驱动**的（每次收到新包时调用一次）。
+无参版本保留了旧版序号启发式（gap≤3 立即越过）以兼容存量测试与 demo；
+`main_client` 已切换到 `consume(nowMs)` 时间驱动模式——这正是下一小节的主题。
+
+#### 时间驱动释放与自适应生效延迟【工程化升级 v2/Phase D 新增】
+
+旧启发式有个隐患：gap > 3 且对端**真的**丢了包时，缓冲区会一直等一个永远不会来的包，
+延迟无界增长。Phase D 引入 `consume(uint64_t nowMs)`，把"要不要越过缺口"的裁判
+从序号换成时间：
+
+1. **`RtpPacket::arrivalMs`**：运行时元数据（不参与序列化），调用方在收到包时打点
+   `setArrivalMs(nowMs())`。类内不读系统时钟——时间由外部注入，单测才能构造任意
+   时间序列（`tests/jitter_time_test.cpp` 就是这么测的）。
+2. **释放条件**：`nowMs - 队首包.arrivalMs ≥ effectiveDelayMs()` → 缺口判丢，越过输出；
+   没等够 → 继续等。等待上限就是生效延迟，**延迟有界**——这正是真实播放器
+   "按渲染时钟取包"的雏形：到了播放时刻，缺的帧只能跳过（丢包容忍优先于完整）。
+3. **自适应生效延迟**：
+
+   ```
+   effectiveDelay = clamp(基础延迟 + 乱序深度 × 包间隔, 基础延迟, 200ms)
+   ```
+
+   乱序深度 = 迟到包序号跨度的 EMA（在序包贡献 0，网络恢复后指数衰减回 0）；
+   包间隔 = 相邻到达间隔的 EMA。直觉：网络乱序越严重，"包还在路上"的等待越值得，
+   缓冲越深；平稳网络下深度趋 0，生效延迟收敛回基础延迟——**低延迟与抗抖动
+   之间按网络实际状况滑动**。这是 NetEq 自适应抖动缓冲的思想雏形。
+
+对应关系速查：`consume(0)`（或无参）≡ 旧规则；未打点 `arrivalMs`（默认 0）的包在
+时间驱动模式下视作"已等够"立即放行——存量调用路径不会卡死。
 
 #### 为什么用 std::map
 
@@ -906,10 +969,12 @@ std::vector<RtpPacket> JitterBuffer::consume() {
 **练习 3.2（模拟回绕）：** 在 `main_demo.cpp` 里先插 `65534, 65535` 再插 `0, 1`，
 验证 Jitter Buffer 能否用 `int16_t` 技巧正确处理回绕而不误判。
 
-**练习 3.3（进阶-实现基于时间的延迟释放）：** 当前 `consume()` 是"立即输出到期/小间隙包"，
-并没有真正利用 `targetDelayMs_` 做延迟。请实现一个基于时间的版本：每个包记录到达时间，
-只有"已缓冲 ≥ targetDelayMs"的包才允许输出。提示：可在 `buffer_` 里存 `(pkt, arrivalMs)`
-的映射，或用 `std::chrono::steady_clock` 记录插入时刻。
+**练习 3.3（v2 已落地-验证时间驱动释放）：** `consume(nowMs)` 已实现基于时间的延迟释放
+（见上文小节）。跑 `crystal_rtp_tests`（含 `jitter_time_test.cpp` 的 7 个用例），然后做
+两个实验：① 把 `effectiveDelayMs()` 的 200ms 上限改成 50ms，观察 `jitter_time_test` 里
+"自适应延迟加深"用例为什么仍然通过（提示：断言的是区间不是精确值）；② 给 `insert()`
+的乱序深度 EMA 增益从 0.25 改成 0.05，重跑测试观察加深/衰减变慢——EMA 增益就是
+"对网络变化的反应速度"旋钮。
 
 ### 面试高频题
 
@@ -3004,6 +3069,150 @@ sudo tc qdisc del dev <网卡> root
 其中**自适应阈值**最能体现工程深度：固定阈值在网络平稳期太松（小抖动也判过载），
 在振荡期太紧（真拥塞判不出来）——libwebrtc 用斜率历史的滑动分位数动态调整，
 这是"把统计学习塞进控制回路"的教科书案例。
+
+***
+
+## Module 12：线程模型与无锁编程【工程化升级 v2/Phase D 新增】
+
+> 对应源码：`src/utils/spsc_ring.h`（无锁环形缓冲）、`src/media/audio/sdl_audio_player.*`
+> （无锁音频播放）、`main_client.cpp`（视频发送三级解耦）。前置阅读：Module 0 的
+> "线程模型"一节（线程清单 + 三级解耦拓扑图）。
+
+### 概念讲解
+
+多线程不是把代码分到几个 `std::thread` 里就完事——**真正的难度全在"共享"上**。
+这一模块回答三个递进的问题：哪里需要同步（找共享）→ 锁还是原子（选武器）→
+能不能彻底无锁（SPSC 的胜利条件）。
+
+#### 1. 找共享：先画"谁在哪个线程摸了这份数据"
+
+同步问题的排查永远是同一个套路：拿一张纸，写下每个共享状态，标出它的**写线程**和
+**读线程**。Phase D 动手做过一遍（`main_client.cpp` 注释里有同样的表）：
+
+| 共享状态         | 写线程     | 读/写线程   | 修复手段            |
+| ------------ | ------ | ------ | ----------------- |
+| twccSendTimes_ | 编码线程   | RTCP 线程  | `std::mutex`（map 结构大） |
+| GccController  | RTCP 线程  | 主循环     | 类内 `std::mutex`   |
+| encoder 上下文   | ~~主循环~~ | 编码线程   | **原子交接码率**（单线程化）  |
+| opusEncoder ctl | ~~主循环~~ | ALSA 线程  | **原子交接 FEC 冗余度**  |
+| forceKeyframe_ | RTCP 线程  | 编码线程   | `std::atomic<bool>`（单标志） |
+| 音频 PCM 缓冲    | 解码线程   | SDL 音频线程 | **SPSC 无锁队列**     |
+
+规律一眼可见：**状态越小越适合原子，结构越复杂越适合锁，实时路径必须无锁。**
+
+#### 2. 为什么"锁到处加"是错的：实时回调的铁律
+
+SDL 音频回调运行在库内部的**高优先级实时线程**上，声卡每 20ms 找它要 960 个采样点，
+要不到就播爆音。如果回调里抢 `mutex`，而锁恰好被解码线程持有（比如正在往队列塞数据），
+就会发生**优先级反转**：高优先级线程反而被低优先级线程的持锁时间卡住。
+v1 的 `SDLAudioPlayer` 用 `mutex + std::queue`，表现为**周期性爆音**——
+不是概率 bug，是结构性的。实时系统铁律：**回调路径上不能有锁。**
+
+#### 3. SPSC：唯一能"完全无锁"的队列形态
+
+队列的无锁化难度取决于**竞争方的数量**：
+
+| 队列形态 | 竞争        | 无锁难度                              |
+| ----- | --------- | --------------------------------- |
+| MPMC   | 多写多读      | 需要 CAS 循环，ABA 问题，极难写对          |
+| MPSC   | 多写单读      | 写方之间要 CAS 竞争                     |
+| SPSC   | 单写单读     | **两个方向各一个原子计数器即可，零竞争**          |
+
+本项目里恰好全是 SPSC 场景：音频（解码线程 → SDL 线程）、视频帧（采集线程 → 编码线程）。
+SPSC 的正确性根基：**写方只写 `writeCount_`、只读 `readCount_`；读方只写 `readCount_`、
+只读 `writeCount_`——每个计数器都只有一个"主人"，不存在对同一变量的并发写。**
+
+#### 4. 内存序：本模块最硬核的三行代码
+
+```cpp
+// 写方                                    读方
+slots_[w % capacity_] = value;            uint64_t w = writeCount_.load(acquire);
+writeCount_.store(w + 1, release);        T v = std::move(slots_[w % capacity_]);
+                                         // 之后 readCount_.store(r+1, release)
+```
+
+**release-acquire 配对**：两个原子变量像两道闸门，把普通内存读写"夹"出跨线程可见性。
+
+- 写方先写槽位数据、后 `store(release)`——release 保证：读方看到新 `writeCount_` 时，
+  槽位数据**必然已就绪**。
+- 读方先 `load(acquire)`——acquire 保证：读到新计数后去读槽位，看到的是**完整数据**，
+  不会读到写一半的"撕裂"值。
+
+少了这对配对，x86 上碰巧能跑（强内存序），ARM 上必现偶发撕裂——**"在我机器上是对的"
+在并发编程里不是论据**。
+
+其他两个工程细节：
+
+- **永不回绕的计数器**：用 `uint64_t` 递增计数、`% capacity` 定位槽位。经典"指针到头
+  归零"方案无法区分满和空；uint64 每纳秒加 1 也要 584 年才溢出，从根上避开。
+- **伪共享**：读写计数器若落在同一 64 字节缓存行，两核之间会缓存行乒乓。
+  `alignas(64)` 把它们隔到不同缓存行。
+
+#### 5. 溢出策略：为什么"丢最旧"必须由消费者执行
+
+直觉上"缓冲满了丢最旧"该由写方做（前移读指针腾位置），但**读指针归读方独占**：
+写方 `fetch_add` 它，可能与读方 `pop` 末尾的 `store` 竞争，把计数器拉回去 →
+水位算出负数（size_t 下溢成天文数字）→ 写方以为有海量空位 → **覆盖读方正读的数据**。
+
+所以本项目的分工：`push()` 只做有界写入（放不下丢最新并计数）；`drop()` 由消费者
+调用丢最旧。视频帧队列"取最新帧"（积压 >1 帧时先 drop 再 pop）、音频水位回落
+（320ms → 160ms），都是消费侧动作。
+
+### 代码精读
+
+`src/utils/spsc_ring.h` 全文约 200 行，逐行可读。重点核对三处：
+
+1. `push()`：`readCount_.load(acquire)` 与写方覆盖槽位前的检查配对——覆盖前先
+   确认旧数据已读走。
+2. `popOne()`：`writeCount_.load(acquire)` 后再 `std::move` 槽位——读到的一定是完整数据。
+3. `main_client.cpp` 的编码线程：`backlog > 1` 先 `drop`——"满丢最旧"的落地位置。
+
+线程安全审计的另一半在 `main_client.cpp`：`twccSendTimesMutex`（编码线程写 map、
+RTCP 线程读 map）、`gccTargetKbps_`（主循环 store、编码线程 load+应用）、
+`opusLossPct_`（同前）。**原子交接的核心思想：控制面只发布"目标值"，执行面
+单线程串行应用——FFmpeg/libopus 这类 C 库上下文从此只被一条线程触碰。**
+
+### 动手练习
+
+**练习 12.1：** 跑 `crystal_thread_tests`（6 个用例），读 `tests/spsc_ring_test.cpp` 的
+"两线程压测"：单生产者推 0..199999，消费者收满后**逐位比对**——零丢失、零重复、
+零错序，这是无锁结构最硬的正确性标准。
+
+**练习 12.2：** 把 `spsc_ring.h` 里两处 `memory_order_acquire` 改成 `relaxed`，
+重跑压测。x86 大概率仍然全绿（强内存序救了你）——这正说明"测试通过"不等于
+"实现正确"。改回去，体会为什么 ARM 设备上这种 bug 最难查。
+
+**练习 12.3：** 在 `spsc_ring.h` 的 `pushOne` 里加一行"写方直接 fetch_add 读指针"
+来丢最旧，构造 4 线程压测（2 生产者），观察水位错乱。改回消费侧 `drop()`，
+理解"每个指针只有一个主人"为什么是 SPSC 正确性的根基。
+
+**练习 12.4：** 给 `[metrics][a]` 行的"下溢计数"写一个观察实验：拔掉 `play()` 的
+调用（注释掉解码线程的播放），听 10 秒爆音/静音交替，看 `underflowCount` 怎么涨。
+
+### 面试高频题
+
+1. **SPSC 环形缓冲为什么可以完全无锁？** 因为每个原子计数器只有一个写者：
+   `writeCount_` 只有生产者改、`readCount_` 只有消费者改，不存在对同一变量的并发写，
+   也就不需要 CAS 重试。加上 release-acquire 配对保证槽位数据的跨线程可见性。
+2. **什么是伪共享？怎么解决？** 两个线程各自频繁写不同变量，但变量落在同一 64 字节
+   缓存行——缓存一致性协议让这行在两核间反复失效（乒乓）。解决：`alignas(64)`
+   按缓存行对齐隔离。
+3. **为什么音频回调里不能加 mutex？** SDL 回调是高优先级实时线程，持锁等待会发生
+   优先级反转/调度延迟，声卡等不到数据就播爆音。正确做法是无锁队列（本项目 SPSC）
+   或预分配 + 原子交换指针。
+4. **release 和 acquire 各保证什么？** release 保证它**之前的**普通读写不会重排到
+   这次 store 之后，且对"看到新值的读者"可见；acquire 保证它**之后的**读写不会
+   重排到这次 load 之前。两者配对建立 happens-before 关系：读者看到新计数器，
+   就一定看得到计数器之前的槽位写入。
+5. **缓冲满了，丢最旧还是丢最新？由谁执行？** 实时音视频丢**最旧**（旧帧/旧采样
+   到端上已错过渲染时刻），且必须由**消费者**执行——写方动读指针会与读方竞争，
+   破坏"每个指针只有一个主人"的无锁前提。
+6. **编码器上下文跨线程共享怎么处理？** 不共享。控制面（主循环/GCC）只把目标码率
+   `store` 进原子变量，编码线程每帧前 `load` 并应用——C 库上下文（FFmpeg/libopus）
+   单线程独占，是"决策与应用解耦"的标准手法。
+7. **怎么验证无锁代码的正确性？** 分层：单元测试构造精确序列（等待/释放边界）、
+   压测做全量集合比对（零丢失零重复）、TSan 查数据竞争、跨架构（x86 通过不算数，
+   ARM 才是试金石）。
 
 ***
 

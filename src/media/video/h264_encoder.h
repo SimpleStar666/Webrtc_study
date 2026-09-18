@@ -33,6 +33,7 @@
 
 #include <vector>
 #include <cstdint>
+#include <atomic>
 #include <functional>
 
 // FFmpeg 核心结构体的前向声明
@@ -121,6 +122,8 @@ public:
     // 请求下一帧强制编码为 IDR 关键帧（响应 RTCP PLI）
     // 场景：对端解码失败/重传放弃后调用，关键帧可独立解码，使画面立即恢复。
     // 幂等：重复调用在下一帧只产生一个 IDR
+    // 线程安全（工程化升级 v2）：RTCP 接收线程调 set，编码线程调
+    // encode 时消费——内部为 atomic<bool>
     void forceKeyframe();
 
     // 运行时调整目标码率（工程化升级 v2 新增，GCC 输出的应用点）
@@ -142,7 +145,7 @@ private:
     int64_t pts_ = 0;               // 显示时间戳（Presentation Time Stamp），单调递增
                                     // 编码器按 PTS 顺序输出，确保解码端正确播放顺序
     EncodedCallback encodedCb_;     // 编码完成回调函数
-    bool forceKeyframe_ = false;    // 关键帧请求标志（encode 时消费并复位）
+    std::atomic<bool> forceKeyframe_{false};  // 关键帧请求标志（RTCP 线程写/编码线程读）
 };
 
 } // namespace crystal

@@ -11,12 +11,19 @@
 //   正常增长：+max(40, 8%×bitrate) kbps（加性增，试探带宽）
 //   钳制 [100, 4000] kbps
 // 过载去抖：连续 3 次 tick 斜率超阈值才降（避免单次抖动误杀）。
+//
+//【线程模型（工程化升级 v2：三级解耦后）】
+// onFeedback/onLossUpdate 在 RTCP 接收线程调用，tick/查询在主循环调用
+// ——内部一把 mutex 保护全部状态。事件率低（每秒几十次），锁开销可忽略；
+// 这不是热路径，无锁化收益远小于复杂度代价（见指南 Module 12）。
+//
 // 生产差异（指南展开）：自适应过载阈值、ProbeController 探测、PacedSender。
 #pragma once
 
 #include "media/gcc/trendline_estimator.h"
 #include "media/rtcp/transport_feedback.h"  // ArrivalSample
 #include <cstdint>
+#include <mutex>
 #include <vector>
 
 namespace crystal {
@@ -42,19 +49,19 @@ public:
     // 周期 tick（如每 100ms）：应用过载状态机 + AIMD 增长，产出新目标码率
     void tick();
 
-    uint32_t targetBitrateKbps() const { return targetKbps_; }
+    uint32_t targetBitrateKbps() const;
 
     // 当前趋势通道斜率（样本不足时 0；>0.01 延迟在涨，<-0.01 在恢复）
     // 观测用：[stats] 行 / Demo 打印，不参与控制
-    double trendSlope() const {
-        return trendline_.ready() ? trendline_.slope() : 0.0;
-    }
+    double trendSlope() const;
 
 private:
+    // 以下三个操作均要求调用方已持锁（tick/onLossUpdate 内部路径）
     void applyDecrease();  // AIMD 乘性减：×0.85（整数算术避免浮点截断）
     void applyIncrease();  // AIMD 加性增：+max(40, 8%)
     void clamp();          // 钳制 [100, 4000]
 
+    mutable std::mutex mutex_;  // RTCP 线程喂样本 vs 主循环 tick 并发
     TrendlineEstimator trendline_;
     uint32_t targetKbps_;
     int overuseStreak_ = 0;   // 连续过载计数（≥3 才降，去抖）

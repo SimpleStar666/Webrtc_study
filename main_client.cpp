@@ -31,18 +31,19 @@
 //
 // 【模块协作关系 - 完整数据流】
 //
-//   ┌──────────────── 发送链路（本地→远端）────────────────┐
-//   │                                                      │
-//   │  摄像头 → [V4L2Capture] → YUV帧                     │
-//   │     → [H264Encoder] → NAL Unit                       │
-//   │     → [RtpPacketizer] → RTP包                        │
-//   │     → [TransportManager/PeerConnection] → 网络        │
-//   │                                                      │
-//   │  麦克风 → [AlsaCapture] → PCM                        │
-//   │     → [OpusEncoder] → Opus帧                         │
-//   │     → [RtpPacketizer] → RTP包                        │
-//   │     → [TransportManager/PeerConnection] → 网络        │
-//   └──────────────────────────────────────────────────────┘
+//   ┌──────────────── 发送链路（本地→远端，三级线程解耦 Phase D）──┐
+//   │                                                              │
+//   │  采集线程: 摄像头 → [V4L2Capture] → memcpy 入队             │
+//   │  帧队列  : [SpscRing 容量2，无锁，满丢最旧]                 │
+//   │  编码线程: 取最新帧 → [H264Encoder] → NAL Unit             │
+//   │     → [RtpPacketizer] → RTP包                                │
+//   │     → [TransportManager/PeerConnection] → 网络               │
+//   │                                                              │
+//   │  采集线程: 麦克风 → [AlsaCapture] → PCM                       │
+//   │     → [OpusEncoder] → Opus帧（码率/FEC 由原子交接的参数驱动）│
+//   │     → [RtpPacketizer] → RTP包                                │
+//   │     → [TransportManager/PeerConnection] → 网络               │
+//   └──────────────────────────────────────────────────────────────┘
 //
 //   ┌──────────────── 接收链路（远端→本地）────────────────┐
 //   │                                                      │
@@ -89,6 +90,7 @@
 #include "media/rtcp/twcc_recorder.h"        // 工程化升级 v2：GCC 接收侧
 #include "media/gcc/gcc_controller.h"        // 工程化升级 v2：GCC 发送侧
 #include "media/monitor/metrics_collector.h"  // 工程化升级 v2：可观测性
+#include "utils/spsc_ring.h"                 // 工程化升级 v2：无锁帧队列（Phase D）
 #include <iostream>
 #include <string>
 #include <thread>
@@ -97,6 +99,7 @@
 #include <random>
 #include <chrono>
 #include <map>
+#include <mutex>
 
 // 全局运行标志，用于优雅退出
 static std::atomic<bool> g_running{true};
@@ -193,8 +196,10 @@ int main(int argc, char* argv[]) {
     crystal::RecvSideReporter videoRecvReport(90000);  // 收对端视频(PT=96)
     crystal::RecvSideReporter audioRecvReport(48000);  // 收对端音频(PT=97)
     // 本端是否已发出过包（决定周期发 SR 还是纯 RR，RFC 3550 6.4）
-    bool videoSent = false, audioSent = false;
+    // atomic：写方分别是编码线程（视频）/采集线程（音频），读方是主循环
+    std::atomic<bool> videoSent{false}, audioSent{false};
     // 当前帧的 RTP 时间戳（修复 Phase 1 全 0 时间戳问题，见回调5）
+    // videoRtpTs 仅编码线程推进/读取；audioRtpTs 仅音频采集线程访问
     uint32_t videoRtpTs = 0, audioRtpTs = 0;
 
     // ---- 步骤4：创建音视频编解码器 ----
@@ -208,9 +213,29 @@ int main(int argc, char* argv[]) {
     //   owd = 到达时刻 - 发送时刻（两端时钟偏移在差分中消掉）
     //   容量上限 512 条滚动淘汰（feedback 窗口 100ms，历史样本足够）
     std::map<uint16_t, double> twccSendTimes_;
+    // twccSendTimes_ 的锁：编码线程写（onEncoded ⑤）/ RTCP 线程读写
+    // （TransportFeedback 处理时查表算 OWD）——std::map 非线程安全
+    std::mutex twccSendTimesMutex;
     // GCC 控制器：起始码率取编码器配置，闭环收敛到网络可用带宽
     crystal::GccController gcc(static_cast<uint32_t>(encConfig.bitrateKbps));
+    // 码率原子交接（Phase D）：主循环 tick 后只 store，编码线程每帧
+    // 前 load+应用——FFmpeg 编码上下文（encode/setBitrate）从此只被
+    // 编码线程触碰，跨线程并发彻底消除
+    std::atomic<uint32_t> gccTargetKbps_{static_cast<uint32_t>(encConfig.bitrateKbps)};
     uint32_t lastAppliedKbps = static_cast<uint32_t>(encConfig.bitrateKbps);  // 去重
+
+    // ---- 视频发送三级解耦（Phase D 新增）----
+    //   采集线程: memcpy 入队（回调只做拷贝，绝不碰编码器）
+    //   帧队列  : SpscRing 无锁传递，容量 2，积压只留最新帧（满丢最旧，
+    //             丢帧计数可观测——消费侧 drop 才安全，见 spsc_ring.h）
+    //   编码线程: 取最新帧 → 应用码率 → encode → RTP 打包 → 发送
+    // 为什么解耦：v1 里采集回调同步做 encode，一次编码耗时 > 帧周期时
+    // 采集线程被拖住，V4L2 内核缓冲积压 → 采集延迟持续爬升
+    crystal::SpscRing<std::vector<uint8_t>> frameQueue(2);
+    std::atomic<bool> encodeRunning{true};   // 编码线程退出标志
+    // Opus FEC 冗余度的原子交接：主循环 store（RR 实测丢包率），
+    // 音频采集线程每帧前 load+应用——libopus 编码器状态不能并发 ctl
+    std::atomic<uint32_t> opusLossPct_{0};
     // 接收侧状态：TWCC 到达记录器（feedback 数据源；mediaSsrc 收到对端首包后补）
     crystal::TwccRecorder twccRecorder(videoSsrc, 0);
 
@@ -286,6 +311,9 @@ int main(int argc, char* argv[]) {
     pc->onTrack([&](const std::vector<uint8_t>& data) {
         crystal::RtpPacket pkt;
         if (!pkt.parse(data.data(), data.size())) return;  // 解析 RTP 包失败则丢弃
+        // 打点到达时刻（Phase D）：时间驱动 JitterBuffer 的时钟由调用方
+        // 注入，类内不读系统时钟——同一时钟也喂给 metrics/RTCP，全链路一致
+        pkt.setArrivalMs(nowMs());
 
         if (pkt.payloadType() == 96) {
             // === 接收统计（RR 数据源）：丢包/回绕/抖动 ===
@@ -307,7 +335,7 @@ int main(int argc, char* argv[]) {
             auto toRequest = nackRequester.onMissing(missing, nowMs());
             sendNack(toRequest);
 
-            auto packets = videoJitterBuf.consume();       // 获取有序的 RTP 包
+            auto packets = videoJitterBuf.consume(nowMs());  // 时间驱动释放（Phase D）
             for (const auto& p : packets) {
                 auto nals = depacketizer.depacketizeH264(p);  // RTP 解包为 NAL Unit
                 for (const auto& nal : nals) {
@@ -324,7 +352,7 @@ int main(int argc, char* argv[]) {
             // 进入 JitterBuffer，远端音频从未被解码播放。insert 是包进入
             // 缓冲区的唯一入口，consume 只负责按序取出
             audioJitterBuf.insert(pkt);
-            auto packets = audioJitterBuf.consume();       // 获取有序的 RTP 包
+            auto packets = audioJitterBuf.consume(nowMs());  // 时间驱动释放（Phase D）
             for (const auto& p : packets) {
                 // ---- FEC 恢复：播放序号跳变 = 上一帧丢失（工程化升级 v2）----
                 // 收到 B 时发现 A(seq-1) 没到 → decodeFec(B) 从 B 中提取
@@ -393,16 +421,21 @@ int main(int argc, char* argv[]) {
             case crystal::RtcpKind::TransportFeedback: {
                 // 对端 TWCC 反馈 → (seq, arrival) → 查本地发送时刻还原 OWD
                 // → GCC 趋势通道（工程化升级 v2）
+                // 加锁：twccSendTimes_ 的写方在编码线程（onEncoded ②），
+                // 这里在 RTCP 线程并发读——std::map 非线程安全
                 crystal::FeedbackSample s;
                 s.arrivals.reserve(p.twcc.received.size());
                 s.owdMs.reserve(p.twcc.received.size());
-                for (const auto& a : p.twcc.received) {
-                    auto it = twccSendTimes_.find(a.seq);
-                    if (it == twccSendTimes_.end()) continue;  // 已淘汰/非本端发出
-                    s.arrivals.push_back(a);
-                    // OWD = 到达 - 发送。两端时钟不同步没关系：
-                    // 恒定偏移在 GccController 的差分中被消掉
-                    s.owdMs.push_back(a.arrivalMs - it->second);
+                {
+                    std::lock_guard<std::mutex> lock(twccSendTimesMutex);
+                    for (const auto& a : p.twcc.received) {
+                        auto it = twccSendTimes_.find(a.seq);
+                        if (it == twccSendTimes_.end()) continue;  // 已淘汰/非本端发出
+                        s.arrivals.push_back(a);
+                        // OWD = 到达 - 发送。两端时钟不同步没关系：
+                        // 恒定偏移在 GccController 的差分中被消掉
+                        s.owdMs.push_back(a.arrivalMs - it->second);
+                    }
                 }
                 if (!s.arrivals.empty()) gcc.onFeedback(s);
                 break;
@@ -451,7 +484,11 @@ int main(int argc, char* argv[]) {
 
     // ---- 回调4：视频编码输出 → RTP 打包 → 发送 ----
     // 编码器每输出一个 NAL Unit，打包为 RTP 包并通过 PeerConnection 发送
-    // 同一帧的多个 NAL 共享同一 RTP 时间戳（videoRtpTs 在回调5按帧推进）
+    // 同一帧的多个 NAL 共享同一 RTP 时间戳（videoRtpTs 在编码线程按帧推进）
+    // 【线程归属（Phase D）】本回调在编码线程执行（由 encode() 同步触发）
+    //   依赖项均为安全：videoPacketizer 编码线程独占；retxBuffer/
+    //   videoMetrics/videoSendReport 自带锁；sendMedia 库内线程安全；
+    //   twccSendTimes_ 显式加锁（RTCP 线程并发读）
     encoder.onEncoded([&](const uint8_t* nalData, size_t nalLen) {
         std::vector<uint8_t> nal(nalData, nalData + nalLen);
         auto packets = videoPacketizer.packetizeH264(nal, videoRtpTs);  // 大 NAL 自动 FU-A 分片
@@ -460,7 +497,9 @@ int main(int argc, char* argv[]) {
             // ① 存入重传缓冲（对端 NACK 时按 seq 补发的就是这份 bytes）
             retxBuffer.store(pkt.sequenceNumber(), data, nowMs());
             // ② GCC：记录 TWCC 序号的发送时刻（feedback 回来后算 OWD 用）
+            // 加锁：RTCP 线程处理 TransportFeedback 时并发读这张表
             if (pkt.hasTwcc()) {
+                std::lock_guard<std::mutex> lock(twccSendTimesMutex);
                 twccSendTimes_[pkt.twccSeq()] = static_cast<double>(nowMs());
                 if (twccSendTimes_.size() > 512)   // 滚动淘汰最老样本
                     twccSendTimes_.erase(twccSendTimes_.begin());
@@ -476,19 +515,30 @@ int main(int argc, char* argv[]) {
         }
     });
 
-    // ---- 回调5：视频采集 → 编码 ----
-    // 摄像头每采集一帧 YUV 数据，送入编码器
-    // 【RTP 时间戳】Phase 1 所有包 timestamp=0，接收端无法判断帧边界，
-    // 也会破坏抖动计算。视频时钟 90kHz，每帧推进 90000/fps。
+    // ---- 回调5：视频采集 → 帧队列（Phase D 三级解耦第一级）----
+    // 【线程归属】本回调在 V4L2 采集线程执行——只做拷贝入队：
+    //   · 绝不碰编码器（FFmpeg 上下文归编码线程独占）
+    //   · 无锁 pushOne，队列满（编码落后 >2 帧）时最新帧被丢弃并计数
+    // 编码耗时再长也拖不住采集线程，V4L2 内核缓冲不再积压——这是
+    // 解耦的核心收益：采集节奏与编码速度彻底脱钩
     capture.onFrame([&](const uint8_t* yuvData, size_t len) {
-        videoRtpTs += 90000 / encConfig.fps;  // 一帧周期（30fps → 3000）
-        encoder.encode(yuvData, len);         // encode 同步触发回调4
+        std::vector<uint8_t> frame(yuvData, yuvData + len);  // memcpy 快照
+        frameQueue.pushOne(std::move(frame));               // 满则丢最新并计数
     });
 
     // ---- 回调6：音频采集 → 编码 → RTP 打包 → 发送 ----
     // 麦克风采集 PCM 数据，编码为 Opus，打包为 RTP 包并发送
     // 音频时钟 48kHz，每帧推进 = 每帧采样数（Opus @48kHz）
+    // 【线程归属】本回调在 ALSA 采集线程执行。libopus 编码器状态不能
+    // 并发 ctl：主循环只 store opusLossPct_（原子交接），实际
+    // setPacketLossPct 由本线程每帧前应用（去重，值没变不重设）
+    uint32_t lastAppliedLossPct = 0;  // 本线程的去重基准（仅采集线程访问）
     alsaCapture.onAudio([&](const int16_t* data, size_t samples) {
+        uint32_t lossPct = opusLossPct_.load(std::memory_order_relaxed);
+        if (lossPct != lastAppliedLossPct) {          // 值变了才动 libopus
+            lastAppliedLossPct = lossPct;
+            opusEncoder.setPacketLossPct(lossPct);
+        }
         auto opusFrame = opusEncoder.encode(data, opusEncoder.frameSize());  // PCM → Opus
         if (!opusFrame.empty()) {
             audioRtpTs += static_cast<uint32_t>(opusEncoder.frameSize());
@@ -591,6 +641,48 @@ int main(int argc, char* argv[]) {
         alsaCapture.startCapture();  // 开始采集，触发 onAudio 回调
     }
 
+    // ====================================================================
+    // 步骤9b：启动编码线程（Phase D 三级解耦第三级）
+    // 取最新帧 → 应用 GCC 码率 → encode →（回调4）打包 → 发送
+    // ====================================================================
+    std::thread encodeThread([&]() {
+        uint32_t appliedKbps = 0;  // 本线程码率去重基准（仅编码线程访问）
+        uint64_t lastPushDrop = 0, lastConsDrop = 0;  // 丢帧计数快照
+        while (encodeRunning.load(std::memory_order_relaxed)) {
+            // 满丢最旧：积压 >1 帧时丢旧帧只留最新。实时视频永远编
+            // "现在"——旧帧编出来到端上也错过渲染时刻，白占带宽。
+            // （丢最旧必须在消费侧执行，原因见 spsc_ring.h 头注释）
+            size_t backlog = frameQueue.size();
+            if (backlog > 1) frameQueue.drop(backlog - 1);
+
+            std::vector<uint8_t> frame;
+            if (!frameQueue.popOne(frame)) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                continue;  // 队列空：轻量休眠等下一帧
+            }
+
+            // 码率原子交接的接收端：主循环只 store，本线程串行应用——
+            // FFmpeg 上下文（encode/setBitrate）自此单线程独占
+            uint32_t target = gccTargetKbps_.load(std::memory_order_relaxed);
+            if (target != appliedKbps) {
+                appliedKbps = target;
+                encoder.setBitrate(target);
+            }
+
+            // RTP 时间戳按"实际经过的帧数"推进（含被丢的）：90kHz 时钟
+            // 与真实采集节奏对齐——丢帧表现为画面跳一格，而非加速播放
+            uint64_t pushDrop = frameQueue.pushDropCount();
+            uint64_t consDrop = frameQueue.consumerDropCount();
+            uint32_t skipped = static_cast<uint32_t>((pushDrop - lastPushDrop) +
+                                                     (consDrop - lastConsDrop));
+            lastPushDrop = pushDrop;
+            lastConsDrop = consDrop;
+            videoRtpTs += (1 + skipped) * (90000 / encConfig.fps);
+
+            encoder.encode(frame.data(), frame.size());  // 同步触发回调4
+        }
+    });
+
     crystal::Logger::info("CrystalRTC client running. Press Ctrl+C to quit.");
 
     // ====================================================================
@@ -625,14 +717,16 @@ int main(int argc, char* argv[]) {
                 pc->sendRtcp(crystal::appendTransportFeedback(fb));
         }
 
-        // --- 每 100ms：GCC tick → 目标码率应用到编码器（发送侧闭环）---
+        // --- 每 100ms：GCC tick → 码率原子交接给编码线程（发送侧闭环）---
+        // 主循环只 store 发布，不直接调 encoder.setBitrate——FFmpeg
+        // 上下文归编码线程独占（Phase D 线程安全修复）
         if (now - lastGccMs >= 100) {
             lastGccMs = now;
             gcc.tick();
             uint32_t target = gcc.targetBitrateKbps();
-            if (target != lastAppliedKbps) {  // 去重：码率没变不动编码器
+            if (target != lastAppliedKbps) {  // 去重：码率没变不发布
                 lastAppliedKbps = target;
-                encoder.setBitrate(target);
+                gccTargetKbps_.store(target, std::memory_order_relaxed);
                 crystal::Logger::info("[gcc] 目标码率 → {}kbps", target);
             }
         }
@@ -685,12 +779,13 @@ int main(int argc, char* argv[]) {
                                   : "n/a";
             crystal::Logger::info(
                 "[stats] 丢包 v{:.1f}% a{:.1f}% | 抖动 v{:.1f}ms a{:.1f}ms | "
-                "RTT {}ms | 重传 {} miss {} | NACK {} 放弃 {} | "
+                "RTT {}ms | 重传 {} miss {} | NACK {} 放弃 {} | 编码丢帧 {} | "
                 "GCC {}kbps slope {:+.3f}",
                 videoRecvReport.lossRate() * 100, audioRecvReport.lossRate() * 100,
                 videoRecvReport.jitterMs(), audioRecvReport.jitterMs(), rtt,
                 retxBuffer.retransmittedCount(), retxBuffer.missCount(),
                 nackRequester.requestedCount(), nackRequester.givenUpCount(),
+                frameQueue.pushDropCount() + frameQueue.consumerDropCount(),
                 lastAppliedKbps, gcc.trendSlope());
 
             // --- 体验侧指标行（工程化升级 v2 新增）---
@@ -701,16 +796,24 @@ int main(int argc, char* argv[]) {
                 audioMetrics.setRttMs(audioSendReport.rttMs());
             crystal::Logger::info("[metrics][v] {}",
                                   videoMetrics.summaryLine());
-            crystal::Logger::info("[metrics][a] {}",
-                                  audioMetrics.summaryLine());
+            // 播放缓冲观测（Phase D）：水位稳态 ~160ms；下溢>0 说明
+            // 供数跟不上播放（网络抖动/JB 耗尽），回落丢是水位收敛动作
+            crystal::Logger::info("[metrics][a] {} | 播放缓冲 {}ms 下溢{} 回落丢{}ms",
+                                  audioMetrics.summaryLine(),
+                                  audioPlayer.bufferedMs(),
+                                  audioPlayer.underflowCount(),
+                                  audioPlayer.droppedMs());
 
             // --- 闭环：RR 实测丢包率 → 动态调 FEC 冗余度（工程化升级 v2）---
             // 对端 RR 报告块里我方音频流的 fraction lost，含义是
             // "我方音频流在对端眼里"的丢包率（8 位定点，255=100%）。
             // 换算成百分比喂给编码器，libopus 据此决定 FEC 冗余量：
             // 丢包率 2% 编 30% 冗余是浪费，丢包率 30% 编 2% 冗余等于没编
-            opusEncoder.setPacketLossPct(
-                audioSendReport.remoteFractionLost() * 100 / 255);
+            // 原子交接（Phase D）：主循环只 store，音频采集线程每帧前
+            // 应用——libopus 编码器状态不能被两个线程并发触碰
+            opusLossPct_.store(
+                audioSendReport.remoteFractionLost() * 100 / 255,
+                std::memory_order_relaxed);
         }
 
         std::this_thread::sleep_for(std::chrono::milliseconds(16));  // ~60fps 轮询
@@ -720,8 +823,12 @@ int main(int argc, char* argv[]) {
     // 优雅退出：按逆序停止各模块
     // ====================================================================
     crystal::Logger::info("Shutting down...");
-    capture.stopCapture();          // 停止视频采集
+    capture.stopCapture();          // 停止视频采集（不再有新帧入队）
     alsaCapture.stopCapture();      // 停止音频采集
+    // 收编码线程（Phase D）：必须在 encoder 析构前 join——线程内还在
+    // 用 encoder/videoPacketizer 等栈对象，不 join 直接返回 = 析构竞态
+    encodeRunning = false;
+    if (encodeThread.joinable()) encodeThread.join();
     signalingClient.leaveRoom();    // 离开房间，通知信令服务器
     signalingClient.disconnect();   // 断开信令连接
 
