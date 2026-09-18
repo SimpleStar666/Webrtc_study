@@ -89,8 +89,11 @@
 #include "media/rtcp/rtcp_reporter.h"
 #include "media/rtcp/twcc_recorder.h"        // 工程化升级 v2：GCC 接收侧
 #include "media/gcc/gcc_controller.h"        // 工程化升级 v2：GCC 发送侧
+#include "media/adaptive/adaptation_controller.h"   // 工程化升级 v2/Phase E：网络自适应
+#include "media/adaptive/framerate_throttler.h"     // 工程化升级 v2/Phase E：帧率节流
 #include "media/monitor/metrics_collector.h"  // 工程化升级 v2：可观测性
 #include "utils/spsc_ring.h"                 // 工程化升级 v2：无锁帧队列（Phase D）
+#include <algorithm>
 #include <iostream>
 #include <string>
 #include <thread>
@@ -107,6 +110,19 @@ static std::atomic<bool> g_running{true};
 // 信号处理函数：捕获 Ctrl+C (SIGINT)，设置运行标志为 false 以退出主循环
 static void signalHandler(int) {
     g_running = false;
+}
+
+// 连接状态名（[net] 行/告警用；libdatachannel State 枚举 → 可读名）
+static const char* pcStateName(rtc::PeerConnection::State st) {
+    switch (st) {
+        case rtc::PeerConnection::State::New:         return "new";
+        case rtc::PeerConnection::State::Connecting:  return "connecting";
+        case rtc::PeerConnection::State::Connected:   return "connected";
+        case rtc::PeerConnection::State::Disconnected: return "disconnected";
+        case rtc::PeerConnection::State::Failed:      return "failed";
+        case rtc::PeerConnection::State::Closed:      return "closed";
+    }
+    return "unknown";
 }
 
 // 单调时钟毫秒数（RTCP 组件的统一时间源，避免系统时间跳变影响）
@@ -223,6 +239,17 @@ int main(int argc, char* argv[]) {
     // 编码线程触碰，跨线程并发彻底消除
     std::atomic<uint32_t> gccTargetKbps_{static_cast<uint32_t>(encConfig.bitrateKbps)};
     uint32_t lastAppliedKbps = static_cast<uint32_t>(encConfig.bitrateKbps);  // 去重
+
+    // ---- 网络自适应（工程化升级 v2/Phase E 新增）----
+    // GCC 之上的跨流策略层：ratio = GCC 目标码率/编码器配置码率，
+    // 联合 RTT/丢包率分级 → 帧率钳制 / FEC 上限 / PLI 决策。
+    // 无锁：仅主循环 200ms tick 访问，决策经原子交接给执行器
+    crystal::AdaptationController adaptation(
+        static_cast<uint32_t>(encConfig.bitrateKbps), encConfig.fps);
+    // 帧率节流执行器：主循环 store 决策帧率，编码线程 shouldEncode 应用
+    crystal::FramerateThrottler fpsThrottler(encConfig.fps);
+    // FEC 冗余度上限（Adaptation 决策，主循环应用时与实测取 min）
+    uint32_t fecCapPct = 40;
 
     // ---- 视频发送三级解耦（Phase D 新增）----
     //   采集线程: memcpy 入队（回调只做拷贝，绝不碰编码器）
@@ -679,6 +706,17 @@ int main(int argc, char* argv[]) {
             lastConsDrop = consDrop;
             videoRtpTs += (1 + skipped) * (90000 / encConfig.fps);
 
+            // --- 策略性丢帧（Phase E）：带宽不足时主动降帧率 ---
+            // 与上面的 backlog 丢帧正交：那是"编码跟不上"（被动），
+            // 这是"网络不够发"（主动）。不重配编码器——x264 上下文
+            // 不动，码率由 GCC 通道单独钳制（MaintainResolution 路径）
+            if (!fpsThrottler.shouldEncode(nowMs())) {
+                // 策略跳过的帧仍按真实节奏推进 RTP 时钟：
+                // 丢帧表现为画面跳一格，而非时间戳漂移后加速播放
+                videoRtpTs += 90000 / encConfig.fps;
+                continue;
+            }
+
             encoder.encode(frame.data(), frame.size());  // 同步触发回调4
         }
     });
@@ -693,6 +731,9 @@ int main(int argc, char* argv[]) {
     uint64_t lastGivenUp = 0;
     uint64_t lastTwccMs = 0;   // TWCC feedback 发送节拍（接收侧，100ms）
     uint64_t lastGccMs = 0;   // GCC tick 节拍（发送侧，100ms）
+    uint64_t lastAdaptMs = 0;   // 网络自适应 tick 节拍（Phase E，200ms）
+    rtc::PeerConnection::State lastPcState = rtc::PeerConnection::State::New;
+    bool wasLinkDown = false;
     while (g_running && !renderer.shouldQuit()) {
         renderer.pollEvents();  // 处理 SDL 窗口事件
         uint64_t now = nowMs();
@@ -729,6 +770,42 @@ int main(int argc, char* argv[]) {
                 gccTargetKbps_.store(target, std::memory_order_relaxed);
                 crystal::Logger::info("[gcc] 目标码率 → {}kbps", target);
             }
+        }
+
+        // --- 每 200ms：网络自适应 tick（Phase E：分级→跨流决策）---
+        if (now - lastAdaptMs >= 200) {
+            lastAdaptMs = now;
+            // 信号收集：GCC 目标码率（压力比分子）+ RTCP 实测
+            crystal::NetworkSignals sig;
+            sig.gccTargetKbps = gcc.targetBitrateKbps();
+            sig.configuredKbps = static_cast<uint32_t>(encConfig.bitrateKbps);
+            sig.rttMs = videoSendReport.hasRtt()
+                            ? videoSendReport.rttMs() : -1.0;
+            // 对端 RR 观测的我方视频流丢包率（8bit 定点 → 百分比）
+            sig.lossPct = videoSendReport.remoteFractionLost() * 100.0 / 255.0;
+            sig.jitterMs = videoRecvReport.jitterMs();            // 仅观测
+            sig.freezeCount =
+                static_cast<uint32_t>(videoMetrics.stallCount()); // 仅观测
+
+            auto d = adaptation.tick(sig, now);
+            // 决策交接：帧率 → 编码线程（原子），FEC 上限 → 5s 块应用
+            fpsThrottler.setTargetFps(d.targetFps);
+            fecCapPct = d.fecCapPct;
+            // Bad 级进入：请求对端关键帧（复用 sendPli 的 500ms 节流）
+            if (d.requestPli) sendPli();
+
+            // --- 连接状态监控（Phase E：ICE 底层归 libdatachannel，
+            //     这里只做轮询观测；断线不重连，见指南"生产差异"）---
+            lastPcState = pc->state();
+            bool linkDown =
+                (lastPcState == rtc::PeerConnection::State::Disconnected ||
+                 lastPcState == rtc::PeerConnection::State::Failed);
+            if (linkDown && !wasLinkDown) {   // 状态沿告警（只报一次）
+                crystal::Logger::warn(
+                    "[net] 连接状态异常: {}（不做重连，见指南生产差异）",
+                    pcStateName(lastPcState));
+            }
+            wasLinkDown = linkDown;
         }
 
         // --- 每 5s：SR/RR + 统计行（RFC 3550 推荐周期）---
@@ -804,6 +881,18 @@ int main(int argc, char* argv[]) {
                                   audioPlayer.underflowCount(),
                                   audioPlayer.droppedMs());
 
+            // --- 连接状态 + 自适应决策行（Phase E 新增）---
+            crystal::Logger::info(
+                "[net] state={} level={} rtt={:.0f}ms | fps策略 {}/{} "
+                "fecCap {}% | 策略丢帧 {} 队列丢帧 {}",
+                pcStateName(lastPcState),
+                crystal::networkQualityName(adaptation.lastDecision().level),
+                videoSendReport.hasRtt() ? videoSendReport.rttMs() : 0.0,
+                adaptation.lastDecision().targetFps, encConfig.fps,
+                adaptation.lastDecision().fecCapPct,
+                fpsThrottler.policyDroppedCount(),
+                frameQueue.pushDropCount() + frameQueue.consumerDropCount());
+
             // --- 闭环：RR 实测丢包率 → 动态调 FEC 冗余度（工程化升级 v2）---
             // 对端 RR 报告块里我方音频流的 fraction lost，含义是
             // "我方音频流在对端眼里"的丢包率（8 位定点，255=100%）。
@@ -811,9 +900,13 @@ int main(int argc, char* argv[]) {
             // 丢包率 2% 编 30% 冗余是浪费，丢包率 30% 编 2% 冗余等于没编
             // 原子交接（Phase D）：主循环只 store，音频采集线程每帧前
             // 应用——libopus 编码器状态不能被两个线程并发触碰
-            opusLossPct_.store(
-                audioSendReport.remoteFractionLost() * 100 / 255,
-                std::memory_order_relaxed);
+            // 实测丢包率与 Adaptation 上限取 min（Phase E）：
+            // Poor 放宽（丢包真实升高）、Bad 收紧（过度 FEC 挤占视频
+            // 有效载荷——protection overhead 的带宽分配权衡）
+            uint32_t measured =
+                audioSendReport.remoteFractionLost() * 100 / 255;
+            opusLossPct_.store(std::min(measured, fecCapPct),
+                               std::memory_order_relaxed);
         }
 
         std::this_thread::sleep_for(std::chrono::milliseconds(16));  // ~60fps 轮询
