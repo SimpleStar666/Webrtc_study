@@ -10,6 +10,8 @@
 //   SDES(PT=202) 源描述：仅实现 CNAME（复合包必备）
 //   NACK(PT=205, FMT=1, RFC 4585) 传输层反馈：请求重传丢失的 RTP 包
 //   PLI (PT=206, FMT=1, RFC 4585) 负载层反馈：请求立即编码关键帧
+//   TWCC(PT=205, FMT=15, draft-holmer) 传输层反馈：回传每个包的到达时刻
+//   （GCC 带宽估计的数据源，工程化升级 v2 新增）
 //
 // 【RTP/RTCP 去复用（RFC 5761 Section 4）】
 // RTP 与 RTCP 同端口复用，区分依据是第 2 个字节：
@@ -29,6 +31,8 @@
 #include <functional>
 #include <string>
 #include <vector>
+
+#include "media/rtcp/transport_feedback.h"
 
 namespace crystal {
 
@@ -112,7 +116,8 @@ struct PliPacket {
 };
 
 // 解析结果标签
-enum class RtcpKind { Unknown, SenderReport, ReceiverReport, Sdes, Nack, Pli };
+enum class RtcpKind { Unknown, SenderReport, ReceiverReport, Sdes, Nack, Pli,
+                      TransportFeedback };
 
 // 解析出的单个 RTCP 子包（按 kind 取对应字段）
 struct RtcpPacket {
@@ -122,6 +127,7 @@ struct RtcpPacket {
     SdesPacket sdes;      // kind == Sdes 时有效
     NackPacket nack;      // kind == Nack 时有效
     PliPacket pli;        // kind == Pli 时有效
+    TwccFeedback twcc;    // kind == TransportFeedback 时有效（v2 新增）
 };
 
 // 复合包解析：一个 UDP 载荷可含多个 RTCP 子包，逐个回调。

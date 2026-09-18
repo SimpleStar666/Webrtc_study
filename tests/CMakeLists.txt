@@ -16,6 +16,7 @@ add_executable(crystal_rtcp_tests
     nack_requester_test.cpp
     rtcp_reporter_test.cpp
     jitter_buffer_gap_test.cpp
+    transport_feedback_test.cpp
 )
 target_link_libraries(crystal_rtcp_tests PRIVATE
     crystal_media_rtcp crystal_media_rtp crystal_utils GTest::gtest_main

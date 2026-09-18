@@ -279,7 +279,7 @@ bool parseRtcpCompound(const uint8_t* data, size_t size,
             break;
         }
         case RTCP_PT_RTPFB: {
-            if (fmtOrCount == RTCP_FMT_NACK) {  // 仅识别 NACK
+            if (fmtOrCount == RTCP_FMT_NACK) {  // NACK
                 if (bodyLen < 8) return false;
                 pkt.kind = RtcpKind::Nack;
                 pkt.nack.senderSsrc = getU32(body);
@@ -289,6 +289,14 @@ bool parseRtcpCompound(const uint8_t* data, size_t size,
                     const uint8_t* f = body + 8 + i * 4;
                     pkt.nack.entries.push_back({getU16(f), getU16(f + 2)});
                 }
+            } else if (fmtOrCount == RTCP_FMT_TWCC) {  // TWCC feedback（v2 新增）
+                // 最小 body：8B 双 SSRC + 8B 反馈固定头（baseSeq/count/refTime/fbCnt）
+                if (bodyLen < 16) return false;
+                pkt.kind = RtcpKind::TransportFeedback;
+                pkt.twcc.senderSsrc = getU32(body);
+                pkt.twcc.mediaSsrc = getU32(body + 4);
+                if (!parseTransportFeedback(body + 8, bodyLen - 8, pkt.twcc))
+                    return false;
             }
             break;  // 其他 FMT 不识别，跳过该子包
         }
