@@ -31,3 +31,18 @@ TEST(MetricsCollector, RenderFpsWindow) {
     // 窗口推进到 [3500,8500)：33*106=3498 <3500 已逐出，实际剩 0 帧
     EXPECT_NEAR(m.renderFpsAt(9000), 0.0, 0.01);
 }
+
+// 发送码率：5s 窗口内字节 × 8 / 5000ms
+TEST(MetricsCollector, SendBitrateWindow) {
+    crystal::MetricsCollector m(90000, 30);
+    // t=0 发 5000 字节，t=1000 发 5000 字节
+    m.onBytesSent(0, 5000);
+    m.onBytesSent(1000, 5000);
+    // 全窗口 10000 字节 → 10000×8/5000ms = 16kbps
+    EXPECT_NEAR(m.sendBitrateKbps(), 16.0, 0.01);
+
+    // t=5100 时 t=0 的样本已逐出，只剩 t=1000 的 5000 字节 → 8kbps
+    // （sendBitrateKbps 内部用最新样本时刻当窗口右端）
+    m.onBytesSent(5100, 0);   // 0 字节打点，仅推进窗口右端
+    EXPECT_NEAR(m.sendBitrateKbps(), 8.0, 0.01);
+}

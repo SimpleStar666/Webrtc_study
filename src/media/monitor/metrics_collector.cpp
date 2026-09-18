@@ -52,9 +52,12 @@ void MetricsCollector::setRttMs(double rttMs) {
 }
 
 // ----------------------------------------------------------------------------
-// onBytesSent - 发送码率窗口（Task 2 实现）
+// onBytesSent - 发送打点：5s 滑动窗口字节累计
 // ----------------------------------------------------------------------------
-void MetricsCollector::onBytesSent(uint64_t /*nowMs*/, size_t /*bytes*/) {
+void MetricsCollector::onBytesSent(uint64_t nowMs, size_t bytes) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    sentBytes_.emplace_back(nowMs, bytes);
+    evictWindowsLocked(nowMs);
 }
 
 // ----------------------------------------------------------------------------
@@ -84,7 +87,21 @@ bool MetricsCollector::hasE2e() const {
 
 double MetricsCollector::e2eDelayMs() const { return 0.0; }  // Task 3 实现
 
-double MetricsCollector::sendBitrateKbps() const { return 0.0; }  // Task 2 实现
+// sendBitrateKbps - 最近 5s 发送码率：窗口字节 × 8 / 5000ms
+// 【窗口右端的取法】用最新打点时刻而非"当前真实时刻"——查询接口不读
+// 时钟（可测性原则），且业务上"上次发送以来的码率"本就该从最后一个包
+// 算起（发送暂停时窗口内容不凭空衰减，语义更稳）。
+double MetricsCollector::sendBitrateKbps() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (sentBytes_.empty()) return 0.0;
+    uint64_t nowMs = sentBytes_.back().first;  // 窗口右端 = 最新打点时刻
+    evictWindowsLocked(nowMs);
+    if (sentBytes_.empty()) return 0.0;
+    size_t total = 0;
+    for (const auto& [ts, n] : sentBytes_) total += n;
+    // kbps = 字节 × 8 bit/字节 / 5000ms（窗口 5s）
+    return static_cast<double>(total) * 8.0 / 5000.0;
+}
 
 std::string MetricsCollector::summaryLine() const {
     // Task 4 实现（拼 [metrics] 行）
