@@ -68,6 +68,18 @@ public:
     std::vector<int16_t> decode(const uint8_t* opusData, size_t len,
                                  int frameSize = 960);
 
+    // decodeFec - FEC 恢复解码（工程化升级 v2 新增）
+    // 从"下一帧"中提取内嵌的上一帧 FEC 副本，返回恢复出的上一帧 PCM
+    //（约低码率质量，因为 FEC 副本是用更低码率编码的）。
+    // 【与 decode 的区别】opus_decode 的最后一个参数 decode_fec：
+    //   decode()     传 0 → 正常解码当前帧
+    //   decodeFec()  传 1 → 提取当前帧中内嵌的【上一帧】冗余副本
+    // 【使用时机】解码端发现上一帧丢失（播放序号跳变）时调用。
+    // 返回值：恢复出的上一帧 PCM；若该帧没有 FEC 数据（编码端未开 FEC /
+    //         DTX 噪声帧 / CELT 音乐帧），返回空 vector，调用方回落 PLC。
+    std::vector<int16_t> decodeFec(const uint8_t* opusData, size_t len,
+                                   int frameSize = 960);
+
 private:
     int sampleRate_;              // 采样率（Hz），解码器按此采样率输出 PCM 数据
     int channels_;                // 声道数，决定输出数据的交错方式

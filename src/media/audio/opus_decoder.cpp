@@ -104,4 +104,41 @@ std::vector<int16_t> OpusDecoder::decode(const uint8_t* opusData, size_t len,
     return output;
 }
 
+// decodeFec - FEC 恢复解码：从下一帧提取上一帧的低码率冗余副本（v2 新增）
+// 核心流程与 decode 完全一致，唯一区别是 opus_decode 最后一个参数传 1：
+//   - decode 传 0：正常解码当前帧 B 的数据
+//   - 本方法传 1：提取 B 中内嵌的【上一帧 A】的 FEC 副本并解码
+//
+// 【为什么需要这个方法——丢帧后的两条恢复路径】
+//   上一帧 A 丢失、当前收到帧 B 时：
+//   - decodeFec(B) = FEC 精确恢复：从 B 提取 A 的冗余副本，质量约等于
+//     低码率编码的 A，音质较好（FEC 是编码端特意嵌入的）
+//   - opus_decode(NULL) = PLC 模糊推测：解码器用历史帧插值生成近似信号，
+//     零带宽成本但音质糊（"能听，不脆"）——作为 FEC 不可用时的兜底
+// 这两者构成 WebRTC 音频抗丢包的两层防线：FEC 在前，PLC 兜底。
+std::vector<int16_t> OpusDecoder::decodeFec(const uint8_t* opusData, size_t len,
+                                             int frameSize) {
+    if (!decoder_) return {};
+
+    // 分配输出缓冲区（大小与 decode 相同：frameSize × 声道数）
+    std::vector<int16_t> output(frameSize * channels_);
+
+    // 调用 opus_decode，最后一个参数 decode_fec = 1
+    // 【关键细节】返回的 samples 是【上一帧】恢复出的采样数，
+    // 不是当前帧的——FEC 恢复的语义就是"用 B 恢复 A"
+    int samples = opus_decode(decoder_, opusData, static_cast<opus_int32>(len),
+                               output.data(), frameSize, 1);
+    if (samples < 0) {
+        // 返回负值说明该帧没有 FEC 数据，可能原因：
+        //   1. 编码端未开启 inband FEC
+        //   2. 该帧是 DTX 舒适噪声帧（静音期，无冗余嵌入）
+        //   3. 该帧是 CELT 模式（音乐帧，FEC 只在 SILK 层生效）
+        // 此时返回空 vector，调用方（接收链路）回落到 PLC 兜底路径
+        return {};
+    }
+
+    output.resize(samples * channels_);
+    return output;
+}
+
 } // namespace crystal

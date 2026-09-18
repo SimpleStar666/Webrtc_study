@@ -90,6 +90,18 @@ bool OpusEncoder::init() {
     // 参数：1=启用，0=禁用
     opus_encoder_ctl(encoder_, OPUS_SET_DTX(1));
 
+    // 启用 inband FEC（Forward Error Correction，前向纠错）（工程化升级 v2 新增）
+    // 【FEC 与 NACK/PLC 的分工——音频抗丢包三层防线】
+    //   NACK 重传：音频不做（重传到达已错过播放时刻）
+    //   FEC      ：当前帧内嵌上一帧低码率副本，丢了上一帧可精确恢复（本行启用）
+    //   PLC      ：解码器用历史帧模糊推测，零带宽（opus_decoder 内置兜底）
+    // 工作方式：编码帧 B 时，把上一帧 A 的低码率副本嵌进 B 的码流中；
+    // 接收端发现 A 丢失后，对 B 调 opus_decode(decode_fec=1) 即可恢复 A。
+    // 注意：inband FEC 只在 SILK 层生效（语音帧），CELT/DTX 帧无 FEC；
+    //       FEC 冗余度由 OPUS_SET_PACKET_LOSS_PERC 控制（运行期动态调整，
+    //       见 setPacketLossPct()）。
+    opus_encoder_ctl(encoder_, OPUS_SET_INBAND_FEC(1));
+
     Logger::info("Opus encoder initialized: {}Hz {}ch @ {}kbps",
                  config_.sampleRate, config_.channels, config_.bitrateKbps);
     return true;
