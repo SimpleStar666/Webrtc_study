@@ -49,14 +49,19 @@ void AdaptationController::applyLadder(NetworkQuality level, uint64_t nowMs) {
         uint32_t want = (level == NetworkQuality::Bad)
                             ? ladder_.back()
                             : std::max(kMinFps, configuredFps_ / 2);
+        // 取"不超过 want 的最高档"——命中即定档，不许再向下扫描：
+        // Poor 固定停 15，若继续匹配更低的 12/10 会每 tick 滑落，
+        // 最终 Poor 与 Bad 无差别（决策表规定的是档位而非下限）
         for (size_t i = 0; i < ladder_.size(); ++i) {
-            if (ladder_[i] <= want && ladder_[i] < targetFps_) {
-                targetFps_ = ladder_[i];
-                lastLadderMoveMs_ = nowMs;
-                return;
+            if (ladder_[i] <= want) {
+                if (ladder_[i] < targetFps_) {
+                    targetFps_ = ladder_[i];
+                    lastLadderMoveMs_ = nowMs;
+                }
+                return;  // 已在目标档或从 Bad 回 Poor：保持不动
             }
         }
-        return;  // 已在目标档或更低：不动（防重复移档刷新 dwell 计时）
+        return;
     }
 
     // 升级：Good/Fair 逐级爬，每级至少停留 kMinDwellMs

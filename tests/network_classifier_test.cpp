@@ -168,3 +168,14 @@ TEST(AdaptationControllerTest, LadderClimbsWithMinDwell) {
                   fpsHistory.end());
     EXPECT_EQ(fpsHistory.size(), 5u);               // 10,12,15,20,30
 }
+
+TEST(AdaptationControllerTest, PoorHoldsAtHalfRungNoSlide) {
+    // 回归：Poor 期间帧率必须稳定在减半档 15，不许每 tick 继续下滑
+    // 到 12/10——决策表规定 Poor=15 固定档（滑落会让 Poor 与 Bad 无差别）
+    AdaptationController c(1000, 30);
+    feedTicks(c, poorSignals(), 3, 0);              // 降到 Poor → fps=15
+    for (int i = 0; i < 10; ++i) {                  // 维持 Poor 2s
+        auto d = c.tick(poorSignals(), 1000 + i * 200);
+        EXPECT_EQ(d.targetFps, 15u);               // 全程 15，无滑落
+    }
+}
