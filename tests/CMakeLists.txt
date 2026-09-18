@@ -3,6 +3,7 @@ add_executable(crystal_rtp_tests
     rtp_packetizer_test.cpp
     rtp_depacketizer_test.cpp
     jitter_buffer_test.cpp
+    twcc_header_test.cpp
 )
 target_link_libraries(crystal_rtp_tests PRIVATE
     crystal_media_rtp crystal_utils GTest::gtest_main

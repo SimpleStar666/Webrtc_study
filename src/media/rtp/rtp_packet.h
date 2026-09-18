@@ -40,7 +40,9 @@
 //   CSRC (0-15 items, 32 bits each): 贡献源标识符，用于混合器场景
 //
 // 【当前实现的简化】
-// 本实现暂不支持填充(P)、扩展(X)、CSRC 字段，仅处理固定 12 字节头部。
+// 本实现不支持填充(P)、CSRC 字段；扩展(X)仅支持 RFC 8285 one-byte header
+// extension 中的 TWCC 传输序号块（工程化升级 v2 新增，见类内 TWCC 小节），
+// 未设置 TWCC 的包仍是纯 12 字节头部（向后兼容）。
 // ============================================================================
 
 #pragma once
@@ -118,7 +120,7 @@ public:
     bool padding() const;
 
     // 获取扩展标志
-    // 返回值: 当前实现固定返回 false（不支持头部扩展）
+    // 返回值: X 位是否置位（v2 起真实反映 TWCC 扩展的设置/解析状态）
     // 说明: 当 X=1 时，固定头部后跟一个扩展头部，用于传递额外信息
     bool extension() const;
 
@@ -206,6 +208,31 @@ public:
     void setPayload(const uint8_t* data, size_t len);
 
     // ========================================================================
+    // TWCC 扩展头（工程化升级 v2 新增）
+    // ========================================================================
+    // 【TWCC 是什么】Transport-wide Congestion Control（draft-holmer）：
+    // 给每个发出的 RTP 包打一个"传输层递增序号"（不分音视频流、跨包计数），
+    // 接收端把每个序号的到达时刻回传给发送端，发送端据此估计带宽。
+    // 这是 GCC 拥塞控制的数据源，也是本项目 v2 带宽估计闭环的第一环。
+
+    // 设置 TWCC 序号（0~65535，每发一个 RTP 包 +1）
+    // 设置后 serialize() 会置 X 位并追加 one-byte extension 块（RFC 8285）：
+    //   [扩展头 4B] 0xBE 0xDE + length(2B，32bit 字数)
+    //   [TWCC 块 4B] ID=1|L=1(1B) + 序号(2B) + 补零(1B)
+    // 未设置时保持纯 12 字节头（向后兼容，音频流不打 TWCC）
+    void setTwccSeq(uint16_t seq);
+
+    // 读取 TWCC 序号（out 参数版本，接线用）
+    // 返回值: 是否携带 TWCC 扩展；seq 未携带时不被写入
+    bool getTwccSeq(uint16_t& seq) const;
+
+    // 是否携带 TWCC 扩展（X=1 且解析到 ID=1 块）
+    bool hasTwcc() const { return hasTwcc_; }
+
+    // 直接读 TWCC 序号（未设置时返回 0；配合 hasTwcc() 使用）
+    uint16_t twccSeq() const { return twccSeq_; }
+
+    // ========================================================================
     // 大小计算
     // ========================================================================
 
@@ -245,6 +272,10 @@ private:
     // 负载数据，紧跟 RTP 头部之后的所有字节
     // 内容格式由 payloadType_ 决定
     std::vector<uint8_t> payload_;
+
+    // TWCC 扩展头状态（工程化升级 v2 新增）
+    bool hasTwcc_ = false;        // 是否携带 TWCC 扩展块（X 位语义）
+    uint16_t twccSeq_ = 0;        // 传输层扩展序号（GCC 带宽估计用）
 };
 
 } // namespace crystal

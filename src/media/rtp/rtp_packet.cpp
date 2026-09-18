@@ -81,6 +81,59 @@ bool RtpPacket::parse(const uint8_t* data, size_t size) {
         return false;
     }
 
+    // 第四步 b：解析扩展头部（工程化升级 v2 新增）
+    // X 位 = byte0 的 bit4。X=1 时固定头部后跟 4 字节扩展头（RFC 8285）：
+    //   0xBE 0xDE | length(2B，扩展数据占多少个 32bit 字，不含这 4 字节本身)
+    // 扩展数据是一串 one-byte extension 块：块首字节 ID(4bit) | L(4bit)，
+    // L = 数据长度 - 1（数据 1~16 字节）。TWCC 用 ID=1，数据 2 字节序号。
+    bool hasExt = (byte0 & 0x10) != 0;
+    hasTwcc_ = false;  // 复位（RtpPacket 对象可能被重复 parse）
+    if (hasExt) {
+        // 扩展头本身 4 字节
+        if (size < header_len + 4) {
+            Logger::error("RTP packet too short for extension header");
+            return false;
+        }
+        // 校验扩展头魔数 0xBEDE（RFC 8285 one-byte/two-byte 通用前缀）
+        if (data[header_len] == 0xBE && data[header_len + 1] == 0xDE) {
+            // length 字段：扩展数据的 32bit 字数
+            uint16_t extWords =
+                (static_cast<uint16_t>(data[header_len + 2]) << 8) |
+                data[header_len + 3];
+            size_t extBytes = static_cast<size_t>(extWords) * 4;
+            size_t extStart = header_len + 4;
+
+            if (extStart + extBytes > size) {
+                Logger::error("RTP extension length overruns packet");
+                return false;
+            }
+
+            // 逐块遍历 one-byte extension，找 TWCC 块（ID=1）
+            // 块布局: [ID(4b)|L(4b)][数据 L+1 字节]，末块后可能补零对齐
+            size_t pos = extStart;
+            size_t extEnd = extStart + extBytes;
+            while (pos + 1 <= extEnd) {
+                uint8_t id = data[pos] >> 4;         // 高 4 位：扩展 ID
+                uint8_t lenByte = data[pos] & 0x0F;  // 低 4 位：数据长度-1
+                size_t dataLen = static_cast<size_t>(lenByte) + 1;
+                size_t blockLen = 1 + dataLen;       // 块首字节 + 数据
+                if (pos + blockLen > extEnd) break;  // 畸形块，停止遍历
+
+                if (id == 1 && dataLen == 2) {
+                    // TWCC 传输序号块：2 字节大端序
+                    twccSeq_ = (static_cast<uint16_t>(data[pos + 1]) << 8) |
+                               data[pos + 2];
+                    hasTwcc_ = true;
+                }
+                pos += blockLen;
+            }
+        }
+        // 头部长度推进到扩展区之后（无论是否识别 0xBEDE，X=1 意味着
+        // 固定头与负载之间有扩展头要跳过）
+        header_len += 4 + ((static_cast<size_t>(
+                     (data[header_len + 2]) << 8) | data[header_len + 3]) * 4);
+    }
+
     // 第五步：提取标记位和负载类型
     // byte1 & 0x80: 提取最高位 M（标记位），0x80 = 1000 0000
     // byte1 & 0x7F: 提取低 7 位 PT（负载类型），0x7F = 0111 1111
@@ -136,11 +189,11 @@ bool RtpPacket::parse(const uint8_t* data, size_t size) {
 // 6. 追加负载数据
 std::vector<uint8_t> RtpPacket::serialize() const {
     std::vector<uint8_t> buf;
-    buf.reserve(12 + payload_.size());
+    buf.reserve(12 + (hasTwcc_ ? 8 : 0) + payload_.size());
 
-    // 组装 Byte0: V=2(占bit7-6) | P=0(bit5) | X=0(bit4) | CC=0(bit3-0)
-    // 2 << 6 = 0x80 = 1000 0000，即版本号 2 占据最高 2 位
-    uint8_t byte0 = (2 << 6) | 0x00;
+    // 组装 Byte0: V=2(占bit7-6) | P=0(bit5) | X=hasTwcc(bit4) | CC=0(bit3-0)
+    // 2 << 6 = 0x80 = 1000 0000；X 位仅在携带 TWCC 扩展时置 1（v2 新增）
+    uint8_t byte0 = (2 << 6) | (hasTwcc_ ? 0x10 : 0x00);
     buf.push_back(byte0);
 
     // 组装 Byte1: M(占bit7) | PT(占bit6-0)
@@ -167,6 +220,21 @@ std::vector<uint8_t> RtpPacket::serialize() const {
     buf.push_back(static_cast<uint8_t>((ssrc_ >> 8) & 0xFF));
     buf.push_back(static_cast<uint8_t>(ssrc_ & 0xFF));
 
+    // TWCC 扩展区（工程化升级 v2 新增，仅 hasTwcc_ 时写入）
+    // [扩展头 4B] 0xBE 0xDE + length=1（扩展数据 4 字节 = 1 个 32bit 字）
+    // [TWCC 块 4B] 0x11（ID=1 | L=1，L=数据长度-1=2-1）+ 序号(2B) + 补零(1B)
+    // 补零是 RFC 8285 要求的 4 字节对齐——扩展数据长度必须是 4 的倍数
+    if (hasTwcc_) {
+        buf.push_back(0xBE);
+        buf.push_back(0xDE);
+        buf.push_back(0x00);
+        buf.push_back(0x01);   // length = 4 字节扩展数据 / 4 - 1 = 1
+        buf.push_back(0x11);   // ID=1（高 4 位）| L=1（低 4 位，数据 2-1）
+        buf.push_back(static_cast<uint8_t>(twccSeq_ >> 8));
+        buf.push_back(static_cast<uint8_t>(twccSeq_ & 0xFF));
+        buf.push_back(0x00);   // 补零对齐（one-byte 块后凑满 32bit）
+    }
+
     // 追加负载数据
     buf.insert(buf.end(), payload_.begin(), payload_.end());
     return buf;
@@ -182,8 +250,8 @@ uint8_t RtpPacket::version() const { return 2; }
 // 填充标志：当前实现不支持填充，固定返回 false
 bool RtpPacket::padding() const { return false; }
 
-// 扩展标志：当前实现不支持头部扩展，固定返回 false
-bool RtpPacket::extension() const { return false; }
+// 扩展标志：真实反映 TWCC 扩展状态（v2 起 X 位随 hasTwcc_ 置位）
+bool RtpPacket::extension() const { return hasTwcc_; }
 
 // CSRC 计数：当前实现不支持 CSRC，固定返回 0
 uint8_t RtpPacket::csrcCount() const { return 0; }
@@ -230,13 +298,33 @@ void RtpPacket::setPayload(const uint8_t* data, size_t len) {
 }
 
 // ============================================================================
+// TWCC 扩展头（工程化升级 v2 新增）
+// ============================================================================
+
+// 设置 TWCC 传输序号——serialize() 据此置 X 位并写入扩展块
+// 由 RtpPacketizer 在生成每个包时调用（seq 递增逻辑在打包器里）
+void RtpPacket::setTwccSeq(uint16_t seq) {
+    twccSeq_ = seq;
+    hasTwcc_ = true;
+}
+
+// 读取 TWCC 序号（out 参数版本）：未携带时返回 false 且不写入 seq
+// 接收端用它判断"这个包是否参与 GCC 统计"
+bool RtpPacket::getTwccSeq(uint16_t& seq) const {
+    if (!hasTwcc_) return false;
+    seq = twccSeq_;
+    return true;
+}
+
+// ============================================================================
 // 大小计算
 // ============================================================================
 
-// 头部大小固定为 12 字节（不含 CSRC 和扩展头部）
-size_t RtpPacket::headerSize() const { return 12; }
+// 头部大小：携带 TWCC 扩展时 = 12 固定 + 4 扩展头 + 4 TWCC 块 = 20
+// （v2 起 extension/CSRC 组合中仅 TWCC 一种实际存在）
+size_t RtpPacket::headerSize() const { return hasTwcc_ ? 20 : 12; }
 
-// 总大小 = 固定头部 12 字节 + 负载长度
-size_t RtpPacket::totalSize() const { return 12 + payload_.size(); }
+// 总大小 = 头部（12 或 20）+ 负载长度
+size_t RtpPacket::totalSize() const { return headerSize() + payload_.size(); }
 
 } // namespace crystal
