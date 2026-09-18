@@ -85,3 +85,10 @@ add_library(crystal_media_monitor STATIC
 )
 target_include_directories(crystal_media_monitor PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(crystal_media_monitor PUBLIC crystal_utils)
+
+# --- Media: GCC（工程化升级 v2：带宽估计）---
+add_library(crystal_media_gcc STATIC
+    media/gcc/trendline_estimator.cpp
+)
+target_include_directories(crystal_media_gcc PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(crystal_media_gcc PUBLIC crystal_utils)
