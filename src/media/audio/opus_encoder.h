@@ -92,6 +92,15 @@ public:
     // 返回值：每帧采样点数，用于外部模块按正确大小提供 PCM 数据
     int frameSize() const { return config_.frameSize; }
 
+    // setPacketLossPct - 动态设置丢包率（0~100%，工程化升级 v2 新增）
+    // 【为什么要动态】FEC 冗余是要花带宽的：丢包率 2% 时编 30% 冗余是浪费，
+    // 丢包率 30% 时编 2% 冗余等于没编。真实做法是把对端 RR 实测丢包率
+    // 周期喂给编码器，让 libopus 自己决定冗余量（丢包率越高冗余越多）。
+    // 数据源：对端 RR 报文里我方音频流的 fraction lost 字段。
+    // 参数：pct - 丢包率百分比，超出 0~100 会被钳制（防御对端误报）
+    // 返回值：true 设置成功，false 编码器未初始化或设置失败
+    bool setPacketLossPct(uint32_t pct);
+
 private:
     OpusEncoderConfig config_;   // 编码器配置参数
     ::OpusEncoder* encoder_ = nullptr;  // libopus 编码器状态指针

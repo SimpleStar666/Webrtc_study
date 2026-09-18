@@ -150,4 +150,18 @@ std::vector<uint8_t> OpusEncoder::encode(const int16_t* pcmData, int frameSize) 
     return output;
 }
 
+// setPacketLossPct - 动态调整 FEC 冗余度（丢包率输入，工程化升级 v2 新增）
+// 实现要点：
+//   1. 钳制：RR 的 fraction lost 是 0~255 的 8 位定点数，换算成百分比后
+//      可能因计算误差超出 100%，传给 libopus 前钳制到合法范围 0~100
+//   2. 返回 ctl 的执行结果：调用方可感知编码器是否真的接受了该值
+//（注：本环境 libopus 头文件的宏名为 OPUS_SET_PACKET_LOSS_PERC，
+//  上游标准名是 OPUS_SET_PACKET_LOSS_PERCENTAGE，仅命名差异）
+bool OpusEncoder::setPacketLossPct(uint32_t pct) {
+    if (!encoder_) return false;
+    if (pct > 100) pct = 100;  // 钳制到 libopus 合法范围
+    return opus_encoder_ctl(encoder_, OPUS_SET_PACKET_LOSS_PERC(
+                               static_cast<opus_int32>(pct))) == OPUS_OK;
+}
+
 } // namespace crystal

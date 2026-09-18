@@ -100,3 +100,22 @@ TEST(OpusDtx, SilenceProducesTinyFrame) {
     // DTX 生效：输出应为 1~3 字节的舒适噪声帧（正常语音帧 40~160 字节）
     EXPECT_LE(last.size(), 3u);
 }
+
+// ============================================================================
+// 丢包率动态喂入测试
+// ============================================================================
+// setPacketLossPct：把对端 RR 实测的丢包率喂给编码器，
+// libopus 据此决定 FEC 冗余量（丢包率高→冗余多）。
+// 本测试验证参数边界：0~100 全区间合法，超出部分应被钳制而非报错。
+TEST(OpusFec, SetPacketLossPct) {
+    crystal::OpusEncoderConfig cfg;
+    crystal::OpusEncoder enc(cfg);
+    ASSERT_TRUE(enc.init());
+
+    // 正常范围 0~100 应全部接受
+    EXPECT_TRUE(enc.setPacketLossPct(0));
+    EXPECT_TRUE(enc.setPacketLossPct(10));
+    EXPECT_TRUE(enc.setPacketLossPct(100));
+    // 超出范围（如对端误报 200%）应钳制到 100 而不是失败
+    EXPECT_TRUE(enc.setPacketLossPct(200));
+}
