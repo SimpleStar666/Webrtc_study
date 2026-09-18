@@ -55,7 +55,7 @@ set_target_properties(crystal_client PROPERTIES LINK_DEPENDS_NO_SHARED ON)
 target_link_libraries(crystal_client PRIVATE
     -Wl,--whole-archive
     crystal_signaling crystal_transport crystal_media_video crystal_media_audio
-    crystal_media_rtp crystal_room crystal_utils
+    crystal_media_rtp crystal_media_monitor crystal_room crystal_utils
     -Wl,--no-whole-archive
     datachannel websockets spdlog::spdlog nlohmann_json::nlohmann_json
     ${SDL2_LIBRARIES}

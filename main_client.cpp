@@ -84,6 +84,7 @@
 #include "media/rtcp/retransmission_buffer.h"
 #include "media/rtcp/nack_requester.h"
 #include "media/rtcp/rtcp_reporter.h"
+#include "media/monitor/metrics_collector.h"  // 工程化升级 v2：可观测性
 #include <iostream>
 #include <string>
 #include <thread>
@@ -188,6 +189,12 @@ int main(int argc, char* argv[]) {
     // 视频编码器：将 YUV 帧编码为 H.264 NAL Unit
     crystal::H264EncoderConfig encConfig;
     crystal::H264Encoder encoder(encConfig);
+
+    // ---- 可观测性指标（工程化升级 v2 新增）----
+    // 每条流一个采集器：视频统计帧率/卡顿/E2E/码率，音频只统计 E2E/码率
+    // （音频没有"帧率"概念，expectedFps=0 关闭帧率/卡顿段）
+    crystal::MetricsCollector videoMetrics(90000, encConfig.fps);
+    crystal::MetricsCollector audioMetrics(48000, 0);
     // 视频解码器：将 H.264 NAL Unit 解码为 YUV 帧
     crystal::H264Decoder decoder;
 
@@ -260,6 +267,8 @@ int main(int argc, char* argv[]) {
             // === 接收统计（RR 数据源）：丢包/回绕/抖动 ===
             videoRecvReport.onPacketReceived(pkt.ssrc(), pkt.sequenceNumber(),
                                              pkt.timestamp(), crystal::nowNtp());
+            // === 体验指标打点：E2E 采样（工程化升级 v2）===
+            videoMetrics.onPacketArrival(nowMs(), pkt.timestamp());
             // === NACK 状态机联动 ===
             // 任意到达的包（含重传包）都解除对应 seq 的待请求状态
             nackRequester.onReceived(pkt.sequenceNumber());
@@ -281,6 +290,7 @@ int main(int argc, char* argv[]) {
             // Opus 自带 PLC 丢包隐藏更划算）
             audioRecvReport.onPacketReceived(pkt.ssrc(), pkt.sequenceNumber(),
                                              pkt.timestamp(), crystal::nowNtp());
+            audioMetrics.onPacketArrival(nowMs(), pkt.timestamp());  // E2E（v2）
             auto packets = audioJitterBuf.consume();       // 获取有序的 RTP 包
             for (const auto& p : packets) {
                 auto frames = depacketizer.depacketizeOpus(p);  // RTP 解包为 Opus 帧
@@ -323,12 +333,22 @@ int main(int argc, char* argv[]) {
                 break;
             }
             case crystal::RtcpKind::SenderReport: {
-                // 对端 SR → 记录到达时刻（我方 RR 报告块 LSR/DLSR 基准）
-                uint64_t ntp = crystal::nowNtp();
-                videoRecvReport.onSenderReport(p.sr.ssrc, ntp);
-                audioRecvReport.onSenderReport(p.sr.ssrc, ntp);
-                break;
-            }
+                    // 对端 SR → 记录到达时刻（我方 RR 报告块 LSR/DLSR 基准）
+                    uint64_t ntp = crystal::nowNtp();
+                    videoRecvReport.onSenderReport(p.sr.ssrc, ntp);
+                    audioRecvReport.onSenderReport(p.sr.ssrc, ntp);
+                    // 工程化升级 v2：SR 同时携带 NTP↔RTP 锚点（同一时刻
+                    // 的两种表示），按 SSRC 喂给对应流的 MetricsCollector，
+                    // 供 E2E 延迟计算（详见 metrics_collector.cpp 注释推导）
+                    if (p.sr.ssrc == videoRecvReport.remoteSsrc()) {
+                        videoMetrics.onSenderReportMapping(p.sr.rtpTimestamp,
+                                                           nowMs());
+                    } else if (p.sr.ssrc == audioRecvReport.remoteSsrc()) {
+                        audioMetrics.onSenderReportMapping(p.sr.rtpTimestamp,
+                                                           nowMs());
+                    }
+                    break;
+                }
             default:
                 break;  // SDES 等本阶段不处理
             }
@@ -347,6 +367,7 @@ int main(int argc, char* argv[]) {
     // 解码器输出 YUV 帧，送入 SDL 渲染器显示
     decoder.onDecoded([&](const uint8_t* yuvData, int width, int height) {
         renderer.render(yuvData, width, height);
+        videoMetrics.onRenderedFrame(nowMs());  // 工程化升级 v2：卡顿/帧率打点
     });
 
     // ---- 回调3b：解码错误 → 节流后请求关键帧 ----
@@ -363,10 +384,12 @@ int main(int argc, char* argv[]) {
             auto data = pkt.serialize();           // 序列化为字节流
             // ① 存入重传缓冲（对端 NACK 时按 seq 补发的就是这份 bytes）
             retxBuffer.store(pkt.sequenceNumber(), data, nowMs());
-            // ② 发送侧统计（SR 的包数/字节数/最新时间戳）
+            // ② 体验指标打点：发送码率（工程化升级 v2）
+            videoMetrics.onBytesSent(nowMs(), data.size());
+            // ③ 发送侧统计（SR 的包数/字节数/最新时间戳）
             videoSendReport.onPacketSent(pkt.sequenceNumber(),
                                          pkt.payload().size(), pkt.timestamp());
-            // ③ 实际发送
+            // ④ 实际发送
             pc->sendMedia(data);                   // 通过 P2P 连接发送
             videoSent = true;
         }
@@ -393,6 +416,7 @@ int main(int argc, char* argv[]) {
                 auto data = pkt.serialize();           // 序列化为字节流
                 audioSendReport.onPacketSent(pkt.sequenceNumber(),
                                              pkt.payload().size(), pkt.timestamp());
+                audioMetrics.onBytesSent(nowMs(), data.size());  // 体验指标（v2）
                 pc->sendMedia(data);                   // 通过 P2P 连接发送
                 audioSent = true;
             }
@@ -560,6 +584,17 @@ int main(int argc, char* argv[]) {
                 videoRecvReport.jitterMs(), audioRecvReport.jitterMs(), rtt,
                 retxBuffer.retransmittedCount(), retxBuffer.missCount(),
                 nackRequester.requestedCount(), nackRequester.givenUpCount());
+
+            // --- 体验侧指标行（工程化升级 v2 新增）---
+            // 网络好 ≠ 体验好：[stats] 看链路，[metrics] 看用户感知
+            if (videoSendReport.hasRtt())
+                videoMetrics.setRttMs(videoSendReport.rttMs());
+            if (audioSendReport.hasRtt())
+                audioMetrics.setRttMs(audioSendReport.rttMs());
+            crystal::Logger::info("[metrics][v] {}",
+                                  videoMetrics.summaryLine());
+            crystal::Logger::info("[metrics][a] {}",
+                                  audioMetrics.summaryLine());
         }
 
         std::this_thread::sleep_for(std::chrono::milliseconds(16));  // ~60fps 轮询
