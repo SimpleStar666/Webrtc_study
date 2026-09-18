@@ -54,6 +54,7 @@
 #include "media/video/h264_encoder.h"
 #include "media/video/h264_decoder.h"
 #include "media/gcc/gcc_controller.h"
+#include "media/adaptive/adaptation_controller.h"
 #include <iomanip>
 #include <iostream>
 #include <vector>
@@ -479,6 +480,86 @@ static int demoGcc() {
 }
 
 // ============================================================================
+// Demo 6: 网络自适应（虚拟网络序列）
+// ============================================================================
+// 目的：无需网络/硬件，纯内存验证 分级去抖 → 跨流决策 的完整行为。
+//
+// 虚拟时间线（每 tick 200ms）：
+//   第 1 段 (tick 0-9)  ：网络平稳  ratio=1.0, loss=0.5%, rtt=40ms → Good
+//   第 2 段 (tick 10-24)：带宽砍半  ratio=0.5,  loss=8%,   rtt=250ms
+//                         → 连续 3 tick 降级 → Poor（fps 30→15）
+//   第 3 段 (tick 25-39)：WiFi 切换 ratio=0.25, loss=20%,  rtt=900ms
+//                         → 连续 3 tick 降级 → Bad（fps→10，PLI 一次）
+//   第 4 段 (tick 40-79)：网络恢复  → 连续 10 tick 升级 → Good
+//                         （帧率阶梯 2s 一级：10→12→15→20→30）
+//
+// 预期观察：快降（3 tick）慢升（10 tick）的不对称；帧率阶梯逐级
+// 恢复而非一步跳回；Bad 进入瞬间 PLI 只触发一次。
+// ============================================================================
+static int demoAdaptive() {
+    printSeparator("Demo 6: 网络自适应（虚拟网络序列）");
+
+    crystal::AdaptationController adaptation(1000, 30);  // 配置 1000kbps/30fps
+    crystal::NetworkQuality lastLv = crystal::NetworkQuality::Good;
+    uint32_t lastFps = 30;
+
+    std::cout << "\n  模拟 80 个 tick（200ms/tick，共 16s）的网络时间线:\n"
+              << "    1-10: 平稳 | 11-25: 带宽砍半 | 26-40: WiFi切换 | 41-80: 恢复\n\n";
+
+    std::cout << "  " << std::left << std::setw(5) << "tick"
+              << std::setw(9) << "gcc"
+              << std::setw(7) << "loss%"
+              << std::setw(7) << "rtt"
+              << std::setw(7) << "等级"
+              << std::setw(6) << "fps"
+              << std::setw(8) << "fecCap"
+              << "动作\n";
+    std::cout << "  " << std::string(52, '-') << "\n";
+
+    for (int t = 0; t < 80; ++t) {
+        crystal::NetworkSignals sig;
+        sig.configuredKbps = 1000;
+        if (t < 10) {            // 平稳
+            sig.gccTargetKbps = 1000; sig.lossPct = 0.5; sig.rttMs = 40;
+        } else if (t < 25) {     // 带宽砍半
+            sig.gccTargetKbps = 500;  sig.lossPct = 8;   sig.rttMs = 250;
+        } else if (t < 40) {     // WiFi 切换（断崖）
+            sig.gccTargetKbps = 250;  sig.lossPct = 20;  sig.rttMs = 900;
+        } else {                 // 恢复
+            sig.gccTargetKbps = 1000; sig.lossPct = 0.5; sig.rttMs = 40;
+        }
+
+        auto d = adaptation.tick(sig, static_cast<uint64_t>(t) * 200);
+
+        // 只打印关键行（等级变化/PLI/阶梯移动/每 5 tick），避免刷屏
+        std::string action = d.requestPli ? "PLI→" : "";
+        bool interesting = (d.level != lastLv) || (d.targetFps != lastFps)
+                           || d.requestPli || (t % 5 == 0);
+        if (interesting) {
+            std::cout << "  " << std::left << std::setw(5) << t
+                      << std::setw(9) << sig.gccTargetKbps
+                      << std::setw(7) << sig.lossPct
+                      << std::setw(7) << static_cast<int>(sig.rttMs)
+                      << std::setw(7) << crystal::networkQualityName(d.level)
+                      << std::setw(6) << d.targetFps
+                      << std::setw(8) << d.fecCapPct
+                      << action << "\n";
+        }
+        lastLv = d.level;
+        lastFps = d.targetFps;
+    }
+
+    std::cout << "\n  [观察结论]\n";
+    std::cout << "  1. 带宽砍半后 3 个 tick（600ms）降级 Poor：fps 30→15\n";
+    std::cout << "  2. WiFi 切换后 3 tick 降级 Bad：fps→10，PLI 触发一次\n";
+    std::cout << "  3. 恢复后 10 个 tick（2s）才升级：帧率阶梯 2s 一级爬回\n";
+    std::cout << "  4. 快降慢升不对称 = 防乒乓（AIMD 同款哲学）\n";
+    std::cout << "  5. Bad 期 fecCap 收紧到 30%：防 FEC 挤占视频载荷\n";
+
+    return 0;
+}
+
+// ============================================================================
 // 主函数：依次执行五个演示
 // ============================================================================
 int main() {
@@ -498,6 +579,7 @@ int main() {
     demoJitterBuffer();    // Demo 3: Jitter Buffer 乱序重排与丢包检测
     demoH264Pipeline();    // Demo 4: 完整编码→RTP→解码流水线
     demoGcc();             // Demo 5: GCC 带宽估计（虚拟信道）
+    demoAdaptive();        // Demo 6: 网络自适应（虚拟网络序列）
 
     // 打印总结
     printSeparator("总结");
@@ -506,7 +588,8 @@ int main() {
     std::cout << "  2. FU-A分片:  大NAL拆成小RTP包，接收端重组\n";
     std::cout << "  3. JitterBuffer: 解决乱序和丢包问题\n";
     std::cout << "  4. 完整管道:  YUV→编码→RTP→解包→解码→YUV\n";
-    std::cout << "  5. GCC带宽估计: 延迟趋势→过载检测→AIMD调码率\n\n";
+    std::cout << "  5. GCC带宽估计: 延迟趋势→过载检测→AIMD调码率\n";
+    std::cout << "  6. 网络自适应:  分级→降帧率/FEC上限/PLI 跨流联动\n\n";
     std::cout << "  接下来请阅读学习指南，深入理解每个模块！\n\n";
 
     return 0;

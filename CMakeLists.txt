@@ -42,6 +42,7 @@ add_executable(crystal_demo main_demo.cpp)
 target_link_libraries(crystal_demo PRIVATE
     -Wl,--whole-archive
     crystal_media_video crystal_media_rtp crystal_utils crystal_media_gcc
+    crystal_media_adaptive
     -Wl,--no-whole-archive
     spdlog::spdlog
     avcodec swresample swscale avutil
