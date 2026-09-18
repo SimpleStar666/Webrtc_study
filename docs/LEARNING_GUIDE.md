@@ -22,6 +22,8 @@
 - [Module 10：工程化](#module-10工程化)
 - [Module 13：可观测性指标【工程化升级 v2 新增】](#module-13可观测性指标工程化升级-v2-新增)
 - [Module 11：GCC 带宽估计【工程化升级 v2 新增】](#module-11gcc-带宽估计工程化升级-v2-新增)
+- [Module 12：线程模型与无锁编程【工程化升级 v2/Phase D 新增】](#module-12线程模型与无锁编程工程化升级-v2phase-d-新增)
+- [Module 14：网络自适应与降级策略【工程化升级 v2/Phase E 新增】](#module-14网络自适应与降级策略工程化升级-v2phase-e-新增)
 - [面试专题](#面试专题)
 - [综合练习](#综合练习)
 - [推荐阅读](#推荐阅读)
@@ -133,6 +135,8 @@
    连接一旦建立，音视频直接在对端之间走 P2P。
 2. **RTCP 是一条反向的控制流。** 媒体包是"我发给你"，RTCP 里却既有"发送报告 SR"
    又有"接收端反馈 RR/NACK/PLI"，方向是双向的。它跑在和 RTP 同一条通道里（同端口）。
+   这条控制面上还有一条向内的信号流：GCC 产出目标码率后，`AdaptationController`
+   消费它做跨流降级策略（帧率/FEC/PLI，详见 Module 14）。
 3. **Jitter Buffer 是接收链路的咽喉。** 网络层给它的包是乱序、有丢、有抖动的，
    它吐给解码器的是"尽量有序、尽量连续"的包。
 
@@ -180,7 +184,7 @@ CrystalRTC/
 
 | 线程                  | 谁创建           | 干什么                                            | 触发的回调                                                      |
 | ------------------- | ------------- | ---------------------------------------------- | ---------------------------------------------------------- |
-| 主线程                 | `main()`      | 主循环：SDL 事件轮询 + RTCP 周期任务（NACK 重试、每 5s 发 SR/RR、GCC tick） | `renderer.pollEvents()`、`nackRequester.tick()`             |
+| 主线程                 | `main()`      | 主循环：SDL 事件轮询 + RTCP 周期任务（NACK 重试、每 5s 发 SR/RR、GCC tick、200ms 自适应 tick） | `renderer.pollEvents()`、`nackRequester.tick()`             |
 | libdatachannel 回调线程 | 库内部           | 收到远端媒体/RTCP/信令状态变化                             | `pc_->onTrack`、`pc_->onRtcp`、`onStateChange`               |
 | V4L2 采集线程           | `V4L2Capture` | 摄像头 DQBUF 取帧，**只 memcpy 入帧队列**（Phase D）       | `capture.onFrame` → `frameQueue.pushOne`                    |
 | 编码线程（Phase D 新增）     | `main()` 手工创建 | 取最新帧 → 编码 → 打包 → 发送                          | `encoder.encode` → `onEncoded` → `sendMedia`                 |
@@ -234,6 +238,9 @@ DQBUF 取帧            取最新帧（丢积压旧帧）          收 NACK
    正是 Module 12 的主题。**
 4. **主循环用** **`sleep_for(16ms)`** **驱动**（约 60fps 轮询），负责一切"按时间触发"的活：
    每 16ms 检查一次有无到期要重试的 NACK，每 100ms 一次 TWCC feedback 与 GCC tick，
+   每 200ms 一次网络自适应 tick——收集 GCC 目标码率/RTT/丢包率 →
+   `AdaptationController` 分级与决策（帧率钳制/FEC 上限/PLI），经原子交接给编码线程
+   （`FramerateThrottler`）与音频采集线程（Opus FEC）（详见 Module 14），
    每 5s 发一次 SR/RR 并打印 `[stats]` 行。
 
 #### 面试时如何一句话介绍项目
@@ -3216,10 +3223,288 @@ RTCP 线程读 map）、`gccTargetKbps_`（主循环 store、编码线程 load+�
 
 ***
 
+## Module 14：网络自适应与降级策略【工程化升级 v2/Phase E 新增】
+
+> 对应源码：`src/media/adaptive/network_quality_classifier.h/.cpp`（纯函数分级器）、
+> `src/media/adaptive/adaptation_controller.h/.cpp`（去抖状态机 + 帧率阶梯）、
+> `src/media/adaptive/framerate_throttler.h`（编码线程策略丢帧）、`main_client.cpp`
+>（200ms tick 集成 + `[net]` 指标行）。前置阅读：Module 11（GCC——本模块的输入
+> 信号从哪来）、Module 12（原子交接——本模块的执行通道）。
+
+### 概念讲解
+
+Module 11 收官时闭环看起来已经完整：TWCC → GCC → 目标码率 → 编码器。但把一个
+真实场景摆上来就露馅了——**带宽掉到配置值的 30%，除了把码率砍到 30%，还该做什么？**
+帧率要不要降？音频 FEC 冗余度要不要动？画面已经花了一屏，要不要立刻要一个关键帧？
+这些问题 GCC 一个都回答不了。
+
+#### 为什么 GCC 不够：估计与策略必须分层
+
+GCC 的职责边界是**估计**：回答"这条链路现在能承载多少"，输出一个 targetKbps，
+仅此而已。**拿这个数去协调几条流、几个执行器，是策略层的活**——libwebrtc 里这层
+在 Call 级：`NetworkController` 汇聚信号，`ResourceAdaptationProcessor`/
+`VideoStreamAdapter` 决定降什么（帧率/分辨率/FEC）。本项目对应的就是 Phase E
+新增的 `AdaptationController`。
+
+为什么必须分层？因为"带宽不够"这一个事实，在不同执行器上的正确动作是**互相反向**
+的：视频帧率该降（少发数据）、音频 FEC 反而该升（丢包多了要多保护）、PLI 该发
+（画质烂了换参考链）。让 GCC 直接指挥这些，估计器就被策略污染——既没法单独
+测试，也没法复用。分层后的三级结构（衔接 Module 11/12 的线程拓扑）：
+
+```
+            ┌──────────── 估计（Module 11）────────────┐
+ TWCC/RR ──> GccController ──> targetKbps ─┐
+            └──────────────────────────────┼─────────┘
+                                           ▼
+            ┌──────── 策略（本模块，主循环 200ms tick）─┐
+ RTT/丢包 ──> classifyNetwork 四级分级                   │
+            │   → AdaptationController 去抖状态机       │
+            │   → 帧率阶梯 / FEC 上限 / PLI edge        │
+            └──────────────────┬──────────────────────┘
+                               ▼ 原子交接（Module 12 手法）
+            ┌──────── 执行器（各自线程单线程应用）───────┐
+ targetFps ──> FramerateThrottler（编码线程，策略丢帧）    │
+ fecCapPct ──> opusLossPct_ 通道（音频采集线程应用）       │
+ requestPli ─> sendPli()（复用 500ms 节流）               │
+            └──────────────────────────────────────────┘
+```
+
+决策只发生在主循环的 200ms tick（`AdaptationController` 单线程调用、无锁），
+执行全部靠原子交接落到各自线程——"控制面发布目标值、执行面单线程应用"的又一次复用。
+
+#### 分级器：级联判定防二义性
+
+`network_quality_classifier.h` 是一个**纯函数**：输入 `NetworkSignals` 结构体，
+输出 Good/Fair/Poor/Bad 四级之一（枚举数值序即劣化序），无时钟、无锁、无副作用
+——单测直接构造边界值。阈值表（`classifyNetwork` 全函数不到 20 行）：
+
+| 等级 | 判定条件（级联，命中即返回） |
+|------|------------------------------|
+| Good | ratio ≥ 0.85 **且** loss < 2% **且** RTT < 150ms |
+| Fair | ratio ≥ 0.60 **且** loss < 5% **且** RTT < 300ms |
+| Bad  | ratio < 0.35 **或** loss ≥ 15% **或** RTT > 800ms |
+| Poor | 以上都不命中（兜底） |
+
+四个设计决策，每个都要能说出"为什么"：
+
+1. **ratio 的含义**：`gccTargetKbps / configuredKbps`——"GCC 能给的"除以
+   "编码器想要的"。GCC 收敛后 ratio 持续 < 1，说明链路撑不起当前配置，这是降级
+   最直接的信号；只看 loss 会漏判——带宽瓶颈不一定丢包，先表现为排队延迟。
+2. **级联而非独立区间**：四个等级若各写独立的 if，边界重叠时（ratio=0.5 且
+   loss=20% 同时满足 Poor 与 Bad 的字面条件）结果不唯一。级联判定 Good →
+   Fair → Bad 命中即返回、兜底 Poor，**任何输入只有一个出口**——状态机防二义
+   的标准写法。再品一下逻辑词：Bad 用"或"（任一指标断崖即 Bad），Good/Fair
+   用"且"（要好必须全都好）。
+3. **RTT < 0 视为不命中**：RTT 要等 SR/RR 配对才有，开局必然未知。当"坏"处理
+   会开局误降级，当"好"处理又危险——所以两个 RTT 条件在未知时都返回不命中：
+   不阻塞判级（ratio/loss 照常工作），也不单独触发 Bad。
+4. **jitter/freezeCount 只观测不判级**：jitter 已被 Jitter Buffer 吸收，
+   freezeCount 是体验信号（接收侧卡顿）——链路信号与体验信号混判容易互斥打架
+   （链路已恢复但画面还在冻）。本阶段它们只随 `[net]` 行输出，取舍见生产差异。
+
+#### 去抖状态机：快降慢升
+
+分级信号在阈值附近会抖：ratio 在 0.60 上下横跳，每跳一次降一级升一级，帧率跟着
+30→20→30→20 乒乓——**比稳定在差网里更糟**（观众看到画面忽快忽慢）。解法是给
+状态迁移加"连续命中"门槛（`candidateStreak_`）：
+
+| 迁移方向 | 连续 tick | 真实时间 | 为什么不对称 |
+|----------|-----------|----------|--------------|
+| 降级（变差） | 3 | 600ms | 恶化每一刻都在伤体验，晚降 = 持续卡顿 |
+| 升级（变好） | 10 | 2s | 恢复初期不稳（WiFi 漫游回切/拥塞缓释），立刻升回容易再打爆来回震荡 |
+
+不对称是 AIMD 同款哲学（乘性降、加性增）。"变差"的判定用枚举数值序：
+Good=0 … Bad=3，`raw > level_` 即 worse。streak 的时间轴：
+
+```
+降级生效（快）：
+信号:    G  G  P  P  P   ……
+streak:        1  2  3 ──> 生效！level_: Good→Poor（600ms）
+
+升级被抖掉（慢，防乒乓）：
+信号:    G  P  G  P  G  P  ……   （level_=Poor 纹丝不动）
+streak:  1  清 1  清 1  清       G 永远数不到 10；P==当前级，streak 清零
+```
+
+关键一行是 `raw == level_`（信号回到当前级）时 `candidateStreak_ = 0`：候选必须
+**连续**出现，插一个反例就清零。`PingPongSignalsKeepLevel` 用例专门验证 G/P
+交替的信号下等级纹丝不动。
+
+#### 帧率阶梯：降级跳档、升级逐级
+
+等级定了，帧率怎么动？阶梯由 `buildLadder` 生成：{100%, 2/3, 50%, 40%, 33%} ×
+配置帧率、下限 10fps——30fps 时就是 {30, 20, 15, 12, 10}。移动规则两条：
+
+- **降级跳档**：Poor 直接跳 50% 档（30→15），Bad 直接跳下限 10。恶化时刻多停
+  一秒都是持续卡顿，跳过去；且"命中即定档"不许继续下扫——Poor 固定停 15，
+  否则每个 tick 都往更低档滑、Poor 和 Bad 就没差别了（`PoorHoldsAtHalfRungNoSlide`
+  用例验证的正是这点）。
+- **升级逐级**：每级至少停 2s（`kMinDwellMs`）再爬一级。恢复是试探性的：爬
+  一级看链路扛不扛得住，扛得住再爬。
+
+降帧率为什么**不重配编码器**？这是 degradation preference 的经典取舍：
+
+| 模式 | 降什么 | 路径 | 成本 |
+|------|--------|------|------|
+| MaintainResolution | 帧率（丢帧实现） | 编码前丢帧，编码器参数不动 | 零成本，x264 上下文不重建 |
+| MaintainFramerate | 分辨率 | ReconfigureEncoder（重路径） | 重建上下文，重配瞬间可能卡顿 |
+| Balanced | 两者都动 | 先丢帧再降分辨率 | libwebrtc 默认，实现最复杂 |
+
+本实现走 MaintainResolution 路径：`FramerateThrottler::shouldEncode` 在编码线程
+逐帧判断"距上一帧不足 1000/targetFps 就丢"，对齐 libwebrtc VideoStreamEncoder
+的 frame dropper。**注意与 Phase D 的 backlog 丢帧正交**：backlog 丢帧是
+SpscRing 积压满（编码跟不上采集——被动、编码器问题）；policy 丢帧是带宽不够
+主动降帧率（本模块——主动、网络策略）。两者都丢帧但含义完全不同，`[net]` 行
+分别计数。
+
+#### FEC 上限曲线与 PLI edge
+
+FEC 上限按等级查表（`fecCapFor`）：
+
+| 等级 | Good/Fair | Poor | Bad |
+|------|-----------|------|-----|
+| fecCapPct | 40% | 50% | 30% |
+
+为什么不是"越差越多冗余"？**protection overhead**：FEC 冗余本身占带宽，50% 冗余
+意味着每两个包里就有一个是校验包。Poor 时丢包真实升高，放宽到 50% 值得；Bad 时
+链路极度受限，冗余会把视频有效载荷挤没——链路越差，保护预算反而要收紧，这是
+带宽分配的经典权衡。应用点在 `main_client.cpp` 的 5s 块：实测丢包率与上限取
+`min` 后 store 进 `opusLossPct_`，音频采集线程应用。
+
+PLI 用 **edge 语义**：进入 Bad 的那个瞬间 `requestPli=true`，决策被读走即清零
+（`pliPending_ = false`），Bad 期间不重复请求；配合发送侧 `sendPli` 已有的
+500ms 节流，双保险防关键帧风暴——I 帧是码率尖刺，连发会把刚降下去的带宽再
+打爆。为什么进 Bad 才要关键帧？断崖级恶化（WiFi 切换）大概率丢的是参考帧，
+NACK 补不回来，直接换参考链最快。
+
+#### 连接状态监控：轮询 vs 回调
+
+自适应 tick 里顺带轮询 `pc->state()`：Disconnected/Failed 的**上升沿**告警一次
+（`linkDown && !wasLinkDown`，不重复刷屏）。三个取舍：
+
+1. **为什么轮询不用回调**：libdatachannel 有 `onStateChange` 回调，但把决策逻辑
+   放进库线程就要加锁/跨线程交接；200ms 轮询对"断线告知"这种秒级需求够用，
+   还能与自适应 tick 共用一次状态读取。
+2. **为什么只告警不重连**：ICE restart 要信令重协商（重换 SDP），教学实现里
+   复杂度不成比例；真实系统里重连也是独立于媒体自适应的连接管理层职责。
+3. **为什么拿不到 selected candidate pair**：libdatachannel 封装了 ICE 内部
+   状态，不暴露 candidate pair 细节——对应 libwebrtc `getStats()` 里
+   `selected-candidate-pair` 一族统计（本地/远端候选、优先级、提名状态）。
+   想做"换路径"级自适应（WiFi/蜂窝切换）必须有这层可见性，这是库选型边界。
+
+### 代码精读
+
+三份头文件的注释本身就是设计文档，按这个顺序读：
+
+1. `src/media/adaptive/network_quality_classifier.h` + `.cpp`：对照阈值表走一遍
+   级联顺序（Good → Fair → Bad，兜底 Poor），确认自己能答上"为什么 Bad 是或、
+   Good 是且""RTT 未知为什么不命中"。
+2. `src/media/adaptive/adaptation_controller.h`：四个常量是全部调参面——
+   `kMinFps=10`、`kDowngradeTicks=3`（600ms）、`kUpgradeTicks=10`（2s）、
+   `kMinDwellMs=2000`。`tick()` 三段结构：去抖状态机 → `applyLadder` → 组装
+   `AdaptationDecision`（值语义返回，调用方自行交接）。
+3. `src/media/adaptive/framerate_throttler.h`：单头文件、无 .cpp。
+   `setTargetFps` 主循环 store / `shouldEncode` 编码线程 load，relaxed 足够
+   ——单个目标值不附带数据发布，晚一帧看到新值无害。`lastEncodedMs_`/
+   `policyDropped_` 仅编码线程访问，无需同步。注意整数除法：`1000/fps` 向下
+   取整，10fps 档实际约 7.6fps——教学实现可接受的轻微欠调。
+4. `main_client.cpp` 搜 "Phase E"：200ms tick 的信号收集（GCC 目标码率作 ratio
+   分子、`videoSendReport` 配对 RTT、RR 的 8bit 定点 fraction lost 换算百分比）
+   → `adaptation.tick` → `fpsThrottler.setTargetFps(d.targetFps)` 原子交接 /
+   `fecCapPct` 存下等 5s 块与实测取 min / `if (d.requestPli) sendPli()`。
+
+`[net]` 行每 5s 输出一次，一眼看全自适应状态：
+
+```
+[net] state=connected level=Poor rtt=250ms | fps策略 15/30 fecCap 50% | 策略丢帧 42 队列丢帧 0
+```
+
+`fps策略 15/30` = 当前目标帧率/配置帧率；`策略丢帧` 是 FramerateThrottler 的
+policy 丢帧、`队列丢帧` 是 SpscRing 的 backlog 丢帧——两类丢帧分开计数，正是
+"主动降带宽"与"被动跟不上"的区别。
+
+### Demo 6 对照（虚拟网络时间线）
+
+`main_demo.cpp` 的 `demoAdaptive()` 用 80 个 tick（200ms/tick，共 16s）模拟四段
+网络，无需硬件：
+
+| 段 | tick | 虚拟信号 | 预期行为 |
+|----|------|----------|----------|
+| 平稳 | 1-10 | ratio=1.0, loss=0.5%, rtt=40ms | Good，fps 30 |
+| 带宽砍半 | 11-25 | ratio=0.5, loss=8%, rtt=250ms | 3 tick（600ms）降 Poor：fps 30→15 |
+| WiFi 切换 | 26-40 | ratio=0.25, loss=20%, rtt=900ms | 3 tick 降 Bad：fps→10，PLI 一次 |
+| 恢复 | 41-80 | 回到平稳值 | 10 tick（2s）升 Good；帧率 2s 一级爬回 10→12→15→20→30 |
+
+跑 `./build/crystal_demo` 看第 6 段，重点观察三个不对称：降级 600ms 生效 vs
+升级 2s 生效；降级跳档 vs 升级逐级；进入 Bad 时 PLI 一次 vs Bad 期间不再请求。
+
+### 动手练习
+
+**练习 14.1：** 跑 `crystal_adaptive_tests`（23 个用例：分级器 10 + 控制器 9 +
+节流器 4），读 `tests/network_classifier_test.cpp` 的 `UnknownRttDoesNotBlockGood`
+与 `UnknownRttStillBadOnRatio`：RTT 未知时 Good 的 RTT 条件"不命中"、Bad 的
+ratio 条件仍生效——两个用例合起来才是"未知不参与判级"的完整语义。
+
+**练习 14.2：** 把 `kDowngradeTicks` 和 `kUpgradeTicks` 都改成 1，重跑 Demo 6
+的第 2→4 段，观察帧率在 15/30 之间横跳——亲手制造一次乒乓，再改回去，理解
+"连续 tick"门槛在防什么。
+
+**练习 14.3：** 把 `fecCapFor` 里 Bad 的返回值从 30 改成 50，然后回答：链路只剩
+300kbps 时，50% FEC 意味着视频有效载荷还剩多少？为什么说"FEC 上限是带宽分配
+问题而不是抗丢包问题"？
+
+**练习 14.4：** 在 Demo 6 里把第 3 段的 rtt 从 900 改成 700（低于 Bad 的 800
+阈值），观察这段仍降 Bad——由 loss=20% ≥ 15% 触发。验证级联判定里 Bad 的
+"或"语义：三个条件任一断崖即 Bad。
+
+### 面试高频题
+
+1. **为什么降级快、升级慢？反过来会怎样？** 降级慢 = 恶化的每一毫秒都在持续
+   伤体验（卡顿/花屏），600ms 内就该动作；升级慢 = 恢复初期带宽不稳（WiFi 漫游
+   回切、拥塞缓释），立刻升回容易再打爆链路来回震荡。反过来（快升慢降）=
+   稳定差网 + 帧率乒乓，两边都糟。不对称与 AIMD 同源：乘性降、加性增。
+2. **帧率降级与分辨率降级的实现路径差异？各自适用场景？** 帧率走编码前丢帧
+   （FramerateThrottler / libwebrtc frame dropper），不动编码器上下文，零成本，
+   适合带宽波动；分辨率走 ReconfigureEncoder 重路径（重建上下文、重配瞬间可能
+   卡顿），但同样码率下每帧质量更高，适合长时间稳定的低带宽。libwebrtc 用
+   degradation preference 三模式让上层选，本实现 = MaintainResolution。
+3. **FEC 冗余度为什么有上限？protection overhead 怎么算？** 冗余本身占带宽：
+   50% 冗余 = 每两个包里一个是校验包。链路总预算固定时，冗余 ↑ = 视频有效载荷
+   ↓，所以曲线非单调：Poor 放宽（丢包真实升高，多保护值得）、Bad 反而收紧
+   （链路极度受限，不能让保护挤占载荷）。overhead 就是 fecCapPct%，与实测
+   丢包率取 min 后应用。
+4. **没有 RTT 数据时怎么分级？** RTT < 0 视为"该条件不命中"：Good/Fair 的
+   RTT 上限条件跳过（不阻塞判好），Bad 的 RTT 条件不触发（不误判坏），
+   ratio/loss 照常工作。原则：**未知信号不参与判级，但判级不能停摆**。
+5. **streak 计数为什么能防乒乓？** 状态迁移要求候选等级**连续**出现 N 次，
+   G/P 交替的信号永远累计不到 3 连续，等级纹丝不动；且信号回到当前级时计数
+   清零——候选要"连续"而非"累计"。比滞回区间（hysteresis band）实现简单，
+   还天然支持"降级门槛低、升级门槛高"的不对称。
+
+### 生产差异（本实现简化了什么）
+
+| 维度 | 本实现 | libwebrtc 生产做法 |
+|------|--------|-------------------|
+| 策略中枢 | AdaptationController 单类状态机 | ResourceAdaptationProcessor：CPU/带宽/丢包注册成 resource，适配请求经仲裁后驱动 VideoStreamEncoder |
+| 降级手段 | 帧率阶梯（丢帧实现） | VideoStreamEncoder 三模式齐全，分辨率降级走 ReconfigureEncoder |
+| 降级触发 | 链路信号（ratio/RTT/loss） | 另有体验驱动：卡顿统计（frozen/dropped frames）、quality scaler（QP 均值驱动）——本实现 freezeCount 仅观测即为此留的口子 |
+| 带宽分配 | 视频跟随 GCC，音频 FEC 有上限 | BitrateAllocator：音视频/多流按优先级瓜分估计值，重传/FEC 预算统一入账 |
+| 多流 | 单视频流 + 单音频流 | Simulcast/SVC：同源多分辨率编码，按接收端带宽选层发送，会议室场景标配 |
+| 路径可见性 | pc->state() 轮询（库不暴露 ICE 细节） | getStats() 的 selected-candidate-pair：候选对、提名状态、收发字节——WiFi/蜂窝切换类"换路径"自适应的前提 |
+
+对应关系一句话：`classifyNetwork + AdaptationController` ≈ libwebrtc 的
+`NetworkController` 信号汇聚 + `ResourceAdaptationProcessor` 决策；
+`FramerateThrottler` ≈ `VideoStreamEncoder` 的 frame dropper（MaintainResolution
+路径）。没做的四块——分辨率降级（重路径）、卡顿驱动的体验降级、跨流带宽分配、
+Simulcast/SVC——每一块都是独立的工程量级，面试里说清"没做什么、为什么、怎么补"
+比假装做过更加分。
+
+***
+
 ## 面试专题
 
-这一章是前面 14 个模块的"出口"：把散落的知识点，按面试官真实的提问方式重组。建议在学完
-Module 0\~13 之后、面试前一周再精读一遍。
+这一章是前面 15 个模块的"出口"：把散落的知识点，按面试官真实的提问方式重组。建议在学完
+Module 0\~14 之后、面试前一周再精读一遍。
 
 ### (a) 项目自我介绍模板（STAR 结构）
 
@@ -3412,6 +3697,23 @@ sudo tc qdisc del dev lo root
 
 **关键点**：自己先跑一遍拿到真实数字再背，面试被追问具体百分比时才能对答如流。"我测过"永远
 比"理论上"可信。
+
+### 网络自适应追问链（Phase E 新增）
+
+Q: 你们网络变差时具体做了什么？
+A: GCC 目标码率联动编码器只是第一层；之上还有网络分级器
+   （ratio+RTT+丢包率四级），分级驱动帧率钳制（编码前策略丢帧，
+   不重配编码器）、Opus FEC 冗余度上限（protection overhead）和
+   PLI 关键帧请求——快降慢升防乒乓。
+
+Q: 为什么丢帧不降分辨率？
+A: 重配 x264 需要重建上下文，重配瞬间可能卡顿；丢帧是零成本降带宽。
+   libwebrtc 的 degradation preference 里 MaintainResolution 模式
+   就是这条路径，Balanced 才会两者都动。
+
+Q: 分级为什么要去抖？
+A: 阈值附近震荡会引发帧率/码率乒乓，体验比稳定差网更糟。
+   降级 600ms 生效、升级 2s 生效——不对称，AIMD 同款哲学。
 
 ***
 
