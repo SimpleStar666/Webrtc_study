@@ -34,6 +34,7 @@ target_link_libraries(crystal_media_rtp PUBLIC crystal_utils)
 add_library(crystal_media_rtcp STATIC
     media/rtcp/rtcp_packet.cpp
     media/rtcp/transport_feedback.cpp
+    media/rtcp/twcc_recorder.cpp
     media/rtcp/retransmission_buffer.cpp
     media/rtcp/nack_requester.cpp
     media/rtcp/rtcp_reporter.cpp

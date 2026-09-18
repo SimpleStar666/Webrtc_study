@@ -141,3 +141,98 @@ TEST(TransportFeedback, EmptyWindow) {
     EXPECT_TRUE(decoded.received.empty());
     EXPECT_TRUE(decoded.lost.empty());
 }
+
+// ============================================================================
+// TwccRecorder（接收端窗口收集，工程化升级 v2 接线新增）
+// ============================================================================
+#include "media/rtcp/twcc_recorder.h"
+
+// 窗口未满 100ms：不产 feedback；满了才产，且样本完整
+TEST(TwccRecorder, HoldsBefore100ms) {
+    crystal::TwccRecorder r(0x1111, 0x2222);
+    r.onPacket(100, 10.0);
+    crystal::TwccFeedback fb;
+    EXPECT_FALSE(r.buildFeedback(95.0, fb));   // 距首样本 85ms < 100ms
+    ASSERT_TRUE(r.buildFeedback(110.0, fb));   // 距首样本 100ms → 产出
+    EXPECT_EQ(fb.senderSsrc, 0x1111u);
+    EXPECT_EQ(fb.mediaSsrc, 0x2222u);
+    EXPECT_EQ(fb.baseSeq, 100u);
+    ASSERT_EQ(fb.received.size(), 1u);
+    EXPECT_EQ(fb.received[0].seq, 100u);
+    EXPECT_TRUE(fb.lost.empty());
+}
+
+// 窗口内序号缺口 → 自动补 lost（TWCC 的逐包丢包检测来源）
+TEST(TwccRecorder, GapFilledAsLost) {
+    crystal::TwccRecorder r(0x1111, 0x2222);
+    r.onPacket(10, 0.0);
+    // 11 丢失
+    r.onPacket(12, 25.0);
+    crystal::TwccFeedback fb;
+    ASSERT_TRUE(r.buildFeedback(200.0, fb));
+    EXPECT_EQ(fb.lost, (std::vector<uint16_t>{11}));
+    ASSERT_EQ(fb.received.size(), 2u);
+    EXPECT_EQ(fb.received[0].seq, 10u);
+    EXPECT_EQ(fb.received[1].seq, 12u);
+}
+
+// 积压 64 包：时间没到也立即产出（防反馈延迟过大）
+TEST(TwccRecorder, BacklogOf64Flushes) {
+    crystal::TwccRecorder r(0x1111, 0x2222);
+    for (int i = 0; i < 64; ++i) r.onPacket(500 + i, i * 1.0);
+    crystal::TwccFeedback fb;
+    ASSERT_TRUE(r.buildFeedback(50.0, fb));    // 仅过 50ms，但包数已达上限
+    EXPECT_EQ(fb.received.size(), 64u);
+    EXPECT_TRUE(fb.lost.empty());
+}
+
+// 序号回绕：65534 → 65535 → 0 连续记录，缺口（65535）正确补 lost
+TEST(TwccRecorder, SeqWraparound) {
+    crystal::TwccRecorder r(0x1111, 0x2222);
+    r.onPacket(65534, 0.0);
+    // 65535 丢失
+    r.onPacket(0, 20.0);   // 回绕
+    crystal::TwccFeedback fb;
+    ASSERT_TRUE(r.buildFeedback(300.0, fb));
+    EXPECT_EQ(fb.baseSeq, 65534u);
+    EXPECT_EQ(fb.lost, (std::vector<uint16_t>{65535}));
+    ASSERT_EQ(fb.received.size(), 2u);
+    EXPECT_EQ(fb.received[0].seq, 65534u);
+    EXPECT_EQ(fb.received[1].seq, 0u);
+}
+
+// mediaSsrc 运行时可更新（对端视频 SSRC 发现后）
+TEST(TwccRecorder, MediaSsrcUpdatable) {
+    crystal::TwccRecorder r(0x1111, 0x2222);
+    r.setMediaSsrc(0x3333);
+    r.onPacket(7, 0.0);
+    crystal::TwccFeedback fb;
+    ASSERT_TRUE(r.buildFeedback(500.0, fb));
+    EXPECT_EQ(fb.mediaSsrc, 0x3333u);
+}
+
+// 整链路：recorder（大数值绝对时钟）→ 编码 → 解码 → 时刻/丢失精确还原
+// 验证会话时钟相对化：refTime 不因绝对时刻巨大而饱和
+TEST(TwccRecorder, EndToEndThroughEncodeDecode) {
+    crystal::TwccRecorder r(0x1111, 0x2222);
+    r.onPacket(100, 8000000.0);   // steady 时钟毫秒，数值巨大
+    r.onPacket(101, 8000012.5);   // +12.5ms
+    r.onPacket(103, 8000040.0);   // 102 丢失
+    crystal::TwccFeedback fb;
+    ASSERT_TRUE(r.buildFeedback(8005000.0, fb));
+
+    auto bytes = crystal::appendTransportFeedback(fb);
+    crystal::TwccFeedback dec;
+    crystal::parseRtcpCompound(bytes.data(), bytes.size(),
+        [&](const crystal::RtcpPacket& p) {
+            if (p.kind == crystal::RtcpKind::TransportFeedback) dec = p.twcc;
+        });
+    ASSERT_EQ(dec.received.size(), 3u);
+    EXPECT_EQ(dec.lost, (std::vector<uint16_t>{102}));
+    EXPECT_EQ(dec.senderSsrc, 0x1111u);
+    EXPECT_EQ(dec.mediaSsrc, 0x2222u);
+    // 到达时刻按会话原点相对化后精确还原（±1ms 量化容差）
+    EXPECT_NEAR(dec.received[0].arrivalMs, 0.0, 1.0);
+    EXPECT_NEAR(dec.received[1].arrivalMs, 12.5, 1.0);
+    EXPECT_NEAR(dec.received[2].arrivalMs, 40.0, 1.0);
+}

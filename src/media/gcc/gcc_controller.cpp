@@ -85,8 +85,10 @@ void GccController::tick() {
         }
     }
 
-    // 加性增：本 tick 没降过 && 丢包通道健康
-    if (!reduced && lastLoss_ < kLossLow) {
+    // 加性增：本 tick 没降过 && 无过载嫌疑 && 丢包通道健康。
+    // streak>0 说明延迟梯度已在爬升——嫌疑期继续加码只会把队列压得更满，
+    // 正确行为是"保持-观察"，等 streak 归零（延迟回落）或攒满 3 次（降）
+    if (!reduced && overuseStreak_ == 0 && lastLoss_ < kLossLow) {
         applyIncrease();
     }
     clamp();

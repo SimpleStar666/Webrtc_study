@@ -26,6 +26,8 @@
 //   - RtpPacketizer    : RTP 打包器，将 NAL/Opus 打包为 RTP 包
 //   - RtpDepacketizer  : RTP 解包器，从 RTP 包提取 NAL/Opus
 //   - JitterBuffer     : 抖动缓冲区，重排乱序 RTP 包，检测丢包
+//   - TwccRecorder     : TWCC 到达记录器，收集每包到达时刻回传对端
+//   - GccController    : GCC 带宽估计器，融合丢包/延迟趋势做 AIMD 调码率
 //
 // 【模块协作关系 - 完整数据流】
 //
@@ -84,6 +86,8 @@
 #include "media/rtcp/retransmission_buffer.h"
 #include "media/rtcp/nack_requester.h"
 #include "media/rtcp/rtcp_reporter.h"
+#include "media/rtcp/twcc_recorder.h"        // 工程化升级 v2：GCC 接收侧
+#include "media/gcc/gcc_controller.h"        // 工程化升级 v2：GCC 发送侧
 #include "media/monitor/metrics_collector.h"  // 工程化升级 v2：可观测性
 #include <iostream>
 #include <string>
@@ -92,6 +96,7 @@
 #include <csignal>
 #include <random>
 #include <chrono>
+#include <map>
 
 // 全局运行标志，用于优雅退出
 static std::atomic<bool> g_running{true};
@@ -157,8 +162,10 @@ int main(int argc, char* argv[]) {
     uint32_t videoSsrc = rd();
     uint32_t audioSsrc = rd();
     // 视频打包器：PT=96（H.264），时钟=90000Hz
+    // enableTwcc=true：每个包打传输层序号扩展头——GCC 带宽估计数据源
     crystal::RtpPacketizer videoPacketizer(96, 90000, videoSsrc,
-                                           static_cast<uint16_t>(rd() & 0xFFFF));
+                                           static_cast<uint16_t>(rd() & 0xFFFF),
+                                           1200, /*enableTwcc=*/true);
     // 音频打包器：PT=97（Opus），时钟=48000Hz
     crystal::RtpPacketizer audioPacketizer(97, 48000, audioSsrc,
                                            static_cast<uint16_t>(rd() & 0xFFFF));
@@ -194,6 +201,18 @@ int main(int argc, char* argv[]) {
     // 视频编码器：将 YUV 帧编码为 H.264 NAL Unit
     crystal::H264EncoderConfig encConfig;
     crystal::H264Encoder encoder(encConfig);
+
+    // ---- 步骤4b：GCC 带宽估计（工程化升级 v2 新增）----
+    // 发送侧状态：
+    //   twccSendTimes_ 记录每个 TWCC 序号的发送时刻——feedback 回来后
+    //   owd = 到达时刻 - 发送时刻（两端时钟偏移在差分中消掉）
+    //   容量上限 512 条滚动淘汰（feedback 窗口 100ms，历史样本足够）
+    std::map<uint16_t, double> twccSendTimes_;
+    // GCC 控制器：起始码率取编码器配置，闭环收敛到网络可用带宽
+    crystal::GccController gcc(static_cast<uint32_t>(encConfig.bitrateKbps));
+    uint32_t lastAppliedKbps = static_cast<uint32_t>(encConfig.bitrateKbps);  // 去重
+    // 接收侧状态：TWCC 到达记录器（feedback 数据源；mediaSsrc 收到对端首包后补）
+    crystal::TwccRecorder twccRecorder(videoSsrc, 0);
 
     // ---- 可观测性指标（工程化升级 v2 新增）----
     // 每条流一个采集器：视频统计帧率/卡顿/E2E/码率，音频只统计 E2E/码率
@@ -272,6 +291,11 @@ int main(int argc, char* argv[]) {
             // === 接收统计（RR 数据源）：丢包/回绕/抖动 ===
             videoRecvReport.onPacketReceived(pkt.ssrc(), pkt.sequenceNumber(),
                                              pkt.timestamp(), crystal::nowNtp());
+            // === GCC 趋势通道数据源：记录 TWCC 包到达时刻（工程化升级 v2）===
+            // 只记时刻，不参与重排/解码——feedback 窗口 100ms 后整批回传对端
+            uint16_t twccSeq;
+            if (pkt.getTwccSeq(twccSeq))
+                twccRecorder.onPacket(twccSeq, static_cast<double>(nowMs()));
             // === 体验指标打点：E2E 采样（工程化升级 v2）===
             videoMetrics.onPacketArrival(nowMs(), pkt.timestamp());
             // === NACK 状态机联动 ===
@@ -355,6 +379,32 @@ int main(int argc, char* argv[]) {
                 uint64_t ntp = crystal::nowNtp();
                 videoSendReport.onReceiverReport(p.rr, ntp);
                 audioSendReport.onReceiverReport(p.rr, ntp);
+                // GCC 丢包通道：对端 RR 报告块里我方视频流的 fraction lost
+                // 是"我方视频在对端眼里"的丢包率（256=100%）。
+                // 只在本 RR 确实携带视频块时喂——避免音频 RR 触发重复的 AIMD 动作
+                for (const auto& b : p.rr.blocks) {
+                    if (b.ssrc == videoSsrc) {
+                        gcc.onLossUpdate(b.fractionLost / 255.0);
+                        break;
+                    }
+                }
+                break;
+            }
+            case crystal::RtcpKind::TransportFeedback: {
+                // 对端 TWCC 反馈 → (seq, arrival) → 查本地发送时刻还原 OWD
+                // → GCC 趋势通道（工程化升级 v2）
+                crystal::FeedbackSample s;
+                s.arrivals.reserve(p.twcc.received.size());
+                s.owdMs.reserve(p.twcc.received.size());
+                for (const auto& a : p.twcc.received) {
+                    auto it = twccSendTimes_.find(a.seq);
+                    if (it == twccSendTimes_.end()) continue;  // 已淘汰/非本端发出
+                    s.arrivals.push_back(a);
+                    // OWD = 到达 - 发送。两端时钟不同步没关系：
+                    // 恒定偏移在 GccController 的差分中被消掉
+                    s.owdMs.push_back(a.arrivalMs - it->second);
+                }
+                if (!s.arrivals.empty()) gcc.onFeedback(s);
                 break;
             }
             case crystal::RtcpKind::SenderReport: {
@@ -409,12 +459,18 @@ int main(int argc, char* argv[]) {
             auto data = pkt.serialize();           // 序列化为字节流
             // ① 存入重传缓冲（对端 NACK 时按 seq 补发的就是这份 bytes）
             retxBuffer.store(pkt.sequenceNumber(), data, nowMs());
-            // ② 体验指标打点：发送码率（工程化升级 v2）
+            // ② GCC：记录 TWCC 序号的发送时刻（feedback 回来后算 OWD 用）
+            if (pkt.hasTwcc()) {
+                twccSendTimes_[pkt.twccSeq()] = static_cast<double>(nowMs());
+                if (twccSendTimes_.size() > 512)   // 滚动淘汰最老样本
+                    twccSendTimes_.erase(twccSendTimes_.begin());
+            }
+            // ③ 体验指标打点：发送码率（工程化升级 v2）
             videoMetrics.onBytesSent(nowMs(), data.size());
-            // ③ 发送侧统计（SR 的包数/字节数/最新时间戳）
+            // ④ 发送侧统计（SR 的包数/字节数/最新时间戳）
             videoSendReport.onPacketSent(pkt.sequenceNumber(),
                                          pkt.payload().size(), pkt.timestamp());
-            // ④ 实际发送
+            // ⑤ 实际发送
             pc->sendMedia(data);                   // 通过 P2P 连接发送
             videoSent = true;
         }
@@ -543,6 +599,8 @@ int main(int argc, char* argv[]) {
     // ====================================================================
     uint64_t lastReportMs = 0;
     uint64_t lastGivenUp = 0;
+    uint64_t lastTwccMs = 0;   // TWCC feedback 发送节拍（接收侧，100ms）
+    uint64_t lastGccMs = 0;   // GCC tick 节拍（发送侧，100ms）
     while (g_running && !renderer.shouldQuit()) {
         renderer.pollEvents();  // 处理 SDL 窗口事件
         uint64_t now = nowMs();
@@ -554,6 +612,29 @@ int main(int argc, char* argv[]) {
         if (nackRequester.givenUpCount() > lastGivenUp) {
             lastGivenUp = nackRequester.givenUpCount();
             sendPli();
+        }
+
+        // --- 每 100ms：接收侧发 TWCC feedback（GCC 趋势通道数据源）---
+        if (now - lastTwccMs >= 100) {
+            lastTwccMs = now;
+            // 对端视频 SSRC 确认后写进 feedback 的 mediaSsrc 字段
+            if (videoRecvReport.active())
+                twccRecorder.setMediaSsrc(videoRecvReport.remoteSsrc());
+            crystal::TwccFeedback fb;
+            if (twccRecorder.buildFeedback(static_cast<double>(now), fb))
+                pc->sendRtcp(crystal::appendTransportFeedback(fb));
+        }
+
+        // --- 每 100ms：GCC tick → 目标码率应用到编码器（发送侧闭环）---
+        if (now - lastGccMs >= 100) {
+            lastGccMs = now;
+            gcc.tick();
+            uint32_t target = gcc.targetBitrateKbps();
+            if (target != lastAppliedKbps) {  // 去重：码率没变不动编码器
+                lastAppliedKbps = target;
+                encoder.setBitrate(target);
+                crystal::Logger::info("[gcc] 目标码率 → {}kbps", target);
+            }
         }
 
         // --- 每 5s：SR/RR + 统计行（RFC 3550 推荐周期）---
@@ -604,11 +685,13 @@ int main(int argc, char* argv[]) {
                                   : "n/a";
             crystal::Logger::info(
                 "[stats] 丢包 v{:.1f}% a{:.1f}% | 抖动 v{:.1f}ms a{:.1f}ms | "
-                "RTT {}ms | 重传 {} miss {} | NACK {} 放弃 {}",
+                "RTT {}ms | 重传 {} miss {} | NACK {} 放弃 {} | "
+                "GCC {}kbps slope {:+.3f}",
                 videoRecvReport.lossRate() * 100, audioRecvReport.lossRate() * 100,
                 videoRecvReport.jitterMs(), audioRecvReport.jitterMs(), rtt,
                 retxBuffer.retransmittedCount(), retxBuffer.missCount(),
-                nackRequester.requestedCount(), nackRequester.givenUpCount());
+                nackRequester.requestedCount(), nackRequester.givenUpCount(),
+                lastAppliedKbps, gcc.trendSlope());
 
             // --- 体验侧指标行（工程化升级 v2 新增）---
             // 网络好 ≠ 体验好：[stats] 看链路，[metrics] 看用户感知

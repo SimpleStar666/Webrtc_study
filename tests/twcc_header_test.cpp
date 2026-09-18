@@ -99,3 +99,42 @@ TEST(TwccHeader, GetTwccSeqReturnsFalseWhenAbsent) {
     EXPECT_FALSE(q.getTwccSeq(seq));
     EXPECT_EQ(seq, 999u);  // 未写入
 }
+
+// ============================================================================
+// Packetizer TWCC 打点（工程化升级 v2 接线新增）
+// ============================================================================
+#include "media/rtp/rtp_packetizer.h"
+
+// 启用 TWCC 的打包器：每个 RTP 包都带连续递增的传输层序号（含 FU-A 分片）
+TEST(TwccHeader, PacketizerStampsConsecutiveSeqs) {
+    crystal::RtpPacketizer pktz(96, 90000, 0x1234, 0, 1200, /*enableTwcc=*/true);
+    std::vector<uint8_t> bigNal(3000, 0x41);  // 触发 FU-A 多分片
+    auto packets = pktz.packetizeH264(bigNal, 90000);
+    ASSERT_GE(packets.size(), 2u);
+
+    uint16_t prev = 0;
+    bool first = true;
+    for (const auto& p : packets) {
+        EXPECT_TRUE(p.hasTwcc());
+        if (!first)
+            EXPECT_EQ(static_cast<uint16_t>(p.twccSeq() - prev), 1u);  // +1 递增
+        prev = p.twccSeq();
+        first = false;
+
+        // 序列化 → 解析往返后序号不丢
+        auto bytes = p.serialize();
+        crystal::RtpPacket q;
+        ASSERT_TRUE(q.parse(bytes.data(), bytes.size()));
+        EXPECT_EQ(q.twccSeq(), p.twccSeq());
+    }
+}
+
+// 未启用（默认）：音频流不打 TWCC，保持纯 12 字节头（向后兼容）
+TEST(TwccHeader, PacketizerWithoutTwccStaysPlain) {
+    crystal::RtpPacketizer pktz(97, 48000, 0x1234, 0, 1200);
+    auto packets = pktz.packetizeOpus({0xAA, 0xBB}, 960);
+    ASSERT_EQ(packets.size(), 1u);
+    EXPECT_FALSE(packets[0].hasTwcc());
+    auto bytes = packets[0].serialize();
+    EXPECT_EQ(bytes.size(), 12u + 2u);  // 纯固定头 + 负载
+}

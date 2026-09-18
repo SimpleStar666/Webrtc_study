@@ -41,7 +41,7 @@ add_subdirectory(tests)
 add_executable(crystal_demo main_demo.cpp)
 target_link_libraries(crystal_demo PRIVATE
     -Wl,--whole-archive
-    crystal_media_video crystal_media_rtp crystal_utils
+    crystal_media_video crystal_media_rtp crystal_utils crystal_media_gcc
     -Wl,--no-whole-archive
     spdlog::spdlog
     avcodec swresample swscale avutil
@@ -56,6 +56,7 @@ target_link_libraries(crystal_client PRIVATE
     -Wl,--whole-archive
     crystal_signaling crystal_transport crystal_media_video crystal_media_audio
     crystal_media_rtp crystal_media_monitor crystal_room crystal_utils
+    crystal_media_gcc
     -Wl,--no-whole-archive
     datachannel websockets spdlog::spdlog nlohmann_json::nlohmann_json
     ${SDL2_LIBRARIES}

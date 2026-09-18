@@ -18,7 +18,7 @@
 //   - H.264 Encoder (h264_encoder.h)  : YUV 帧 → H.264 NAL Unit 编码
 //   - H.264 Decoder (h264_decoder.h)  : H.264 NAL Unit → YUV 帧解码
 //
-// 【四个演示的各自目的】
+// 【五个演示的各自目的】
 //   Demo 1 - RTP 包构造与解析：
 //     展示 RTP 包头各字段的含义，以及如何将 RTP 包序列化为字节流、
 //     再从字节流解析回来。这是理解 WebRTC 媒体传输的基础。
@@ -35,6 +35,10 @@
 //     将前三个演示串联起来，展示 YUV 帧 → H.264 编码 → RTP 打包 →
 //     Jitter Buffer → RTP 解包 → H.264 解码 → YUV 帧的完整数据流。
 //
+//   Demo 5 - GCC 带宽估计（虚拟信道）：
+//     纯内存模拟网络劣化，观察 GCC 的过载检测状态机与 AIMD 速率控制
+//     如何联动：信道平稳时码率爬升，带宽劣化时 ×0.85 阶梯式退避。
+//
 // 【模块协作关系图】
 //
 //   发送端:  YUV帧 → [H264Encoder] → NAL → [RtpPacketizer] → RTP包 → 网络
@@ -49,6 +53,8 @@
 #include "media/rtp/jitter_buffer.h"
 #include "media/video/h264_encoder.h"
 #include "media/video/h264_decoder.h"
+#include "media/gcc/gcc_controller.h"
+#include <iomanip>
 #include <iostream>
 #include <vector>
 #include <chrono>
@@ -412,7 +418,68 @@ static int demoH264Pipeline() {
 }
 
 // ============================================================================
-// 主函数：依次执行四个演示
+// Demo 5: GCC 带宽估计（虚拟信道）
+// ============================================================================
+// 目的：无需网络/硬件，纯内存验证 GCC 状态机 + AIMD 的完整行为。
+//
+// 虚拟信道构造（模拟 60 个视频包，16ms 发送间隔，每 5 包一批 feedback）：
+//   前 30 包：排队延迟恒定 50ms → 延迟梯度 slope≈0 → AIMD 加性增爬升
+//   后 30 包：每包多排 0.6ms 队 → slope = 0.6/16 = 0.0375 > 0.01
+//             → 连续 3 tick 过载 → ×0.85 乘性减
+//
+// 预期观察：码率先爬升，带宽劣化出现后约 3 个 tick 下降，之后随劣化
+// 持续继续退避——这就是 WebRTC 拥塞控制的核心曲线。
+// ============================================================================
+static int demoGcc() {
+    printSeparator("Demo 5: GCC 带宽估计（虚拟信道）");
+
+    crystal::GccController gcc(1000);  // 起始码率 1000kbps
+
+    std::cout << "\n  模拟 60 个视频包（16ms 间隔）经过虚拟信道:\n";
+    std::cout << "    前 30 包: 信道平稳（排队延迟不变，slope≈0 → 爬升）\n";
+    std::cout << "    后 30 包: 带宽劣化（每包多排队 0.6ms，slope>0 → ×0.85）\n\n";
+
+    std::cout << "  " << std::left << std::setw(6) << "tick"
+              << std::setw(12) << "码率(kbps)"
+              << std::setw(10) << "斜率"
+              << "信道状态\n";
+    std::cout << "  " << std::string(38, '-') << "\n";
+
+    for (int batch = 0; batch < 12; ++batch) {  // 12 批 × 5 包 = 60 包
+        crystal::FeedbackSample s;
+        for (int j = 0; j < 5; ++j) {
+            int i = batch * 5 + j;                  // 全局包序号
+            double sendMs = i * 16.0;                // 发送时刻
+            double owdMs = 50.0;                     // 基础单向延迟
+            if (i >= 30) owdMs += (i - 30) * 0.6;    // 劣化：排队延迟线性增长
+            // 到达时刻 = 发送 + 延迟（发送端视角还原的样本）
+            s.arrivals.push_back({static_cast<uint16_t>(i), sendMs + owdMs});
+            s.owdMs.push_back(owdMs);
+        }
+        gcc.onFeedback(s);   // 喂趋势通道
+        gcc.tick();          // 应用状态机 + AIMD
+
+        const char* phase = (batch * 5 < 30) ? "平稳" : "劣化";
+        std::cout << "  " << std::left << std::setw(6) << batch
+                  << std::setw(12) << gcc.targetBitrateKbps()
+                  << std::setw(10) << std::fixed << std::setprecision(3)
+                  << gcc.trendSlope() << phase << "\n";
+    }
+    std::cout.unsetf(std::ios::fixed);
+
+    std::cout << "\n  [观察结论]\n";
+    std::cout << "  1. 前 7 个 tick: 斜率≈0，AIMD 加性增（+8%/tick）→ 码率爬升\n";
+    std::cout << "  2. 斜率超阈值（0.01）后：过载嫌疑期先保持码率不加码\n";
+    std::cout << "     （继续加码只会把队列压得更满）\n";
+    std::cout << "  3. 连续 3 tick 过载 → ×0.85 乘性减，劣化持续则保持低位\n";
+    std::cout << "  爬升 → 保持 → 退避，这就是 GCC 的过载响应曲线\n";
+    std::cout << "  （简化版，无自适应阈值/探测，见指南\"生产差异\"）\n";
+
+    return 0;
+}
+
+// ============================================================================
+// 主函数：依次执行五个演示
 // ============================================================================
 int main() {
     // 初始化日志系统，设置日志级别为 warn 以减少干扰输出
@@ -425,11 +492,12 @@ int main() {
     std::cout << "║   无需摄像头/麦克风，直接运行看效果       ║\n";
     std::cout << "╚══════════════════════════════════════════╝\n";
 
-    // 依次执行四个演示，从简单到复杂
+    // 依次执行五个演示，从简单到复杂
     demoRtpPacket();       // Demo 1: RTP 包构造与解析
     demoFUA();             // Demo 2: FU-A 分片与重组
     demoJitterBuffer();    // Demo 3: Jitter Buffer 乱序重排与丢包检测
     demoH264Pipeline();    // Demo 4: 完整编码→RTP→解码流水线
+    demoGcc();             // Demo 5: GCC 带宽估计（虚拟信道）
 
     // 打印总结
     printSeparator("总结");
@@ -437,7 +505,8 @@ int main() {
     std::cout << "  1. RTP包构造: 12字节固定头 + 负载\n";
     std::cout << "  2. FU-A分片:  大NAL拆成小RTP包，接收端重组\n";
     std::cout << "  3. JitterBuffer: 解决乱序和丢包问题\n";
-    std::cout << "  4. 完整管道:  YUV→编码→RTP→解包→解码→YUV\n\n";
+    std::cout << "  4. 完整管道:  YUV→编码→RTP→解包→解码→YUV\n";
+    std::cout << "  5. GCC带宽估计: 延迟趋势→过载检测→AIMD调码率\n\n";
     std::cout << "  接下来请阅读学习指南，深入理解每个模块！\n\n";
 
     return 0;

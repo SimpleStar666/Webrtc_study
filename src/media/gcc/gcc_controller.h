@@ -44,6 +44,12 @@ public:
 
     uint32_t targetBitrateKbps() const { return targetKbps_; }
 
+    // 当前趋势通道斜率（样本不足时 0；>0.01 延迟在涨，<-0.01 在恢复）
+    // 观测用：[stats] 行 / Demo 打印，不参与控制
+    double trendSlope() const {
+        return trendline_.ready() ? trendline_.slope() : 0.0;
+    }
+
 private:
     void applyDecrease();  // AIMD 乘性减：×0.85（整数算术避免浮点截断）
     void applyIncrease();  // AIMD 加性增：+max(40, 8%)

@@ -351,4 +351,26 @@ void H264Encoder::forceKeyframe() {
     forceKeyframe_ = true;
 }
 
+// ============================================================================
+// H264Encoder::setBitrate() - 运行时调整目标码率（工程化升级 v2 新增）
+// ============================================================================
+// GCC 带宽估计输出目标码率的唯一应用点。libx264 的 RC 机制支持在线改
+// bit_rate：后续帧的 QP（量化参数）会围绕新目标重新平衡，无需重建
+// 编码器——重开编码器会触发 IDR（体积是 P 帧数倍）且期间无法编码。
+//
+// 钳制范围 [100, 4000] kbps 与 GccController 输出一致：下限保证
+// 语音级可用画质（再低 x264 会拒绝收敛），上限是本项目 720p 配置
+// 的合理天花板。
+bool H264Encoder::setBitrate(uint32_t kbps) {
+    if (kbps < 100) kbps = 100;    // 与 GccController::clamp() 同步
+    if (kbps > 4000) kbps = 4000;
+
+    config_.bitrateKbps = static_cast<int>(kbps);  // 保持配置一致
+
+    if (!codecCtx_) return true;  // init 前调用：只改配置，init 时生效
+
+    codecCtx_->bit_rate = static_cast<int64_t>(kbps) * 1000;
+    return true;
+}
+
 } // namespace crystal

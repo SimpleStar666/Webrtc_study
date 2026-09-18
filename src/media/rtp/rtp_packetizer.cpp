@@ -20,6 +20,7 @@
 
 #include "media/rtp/rtp_packetizer.h"
 #include "utils/logger.h"
+#include <random>
 
 namespace crystal {
 
@@ -29,11 +30,17 @@ namespace crystal {
 //
 // 初始化打包器的各项参数。序列号从 startSeqNum 开始，每次打包递增。
 // 注意：RFC 3550 建议初始序列号随机选择，以提高安全性（防止已知明文攻击）。
+//
+// TWCC 序号（工程化升级 v2）：启用时同样随机初始化，随后每包 +1。
+// 它与 RTP 序列号是两套独立计数——RTP seq 面向丢包检测/重排，
+// TWCC seq 面向带宽估计的到达时刻关联。
 RtpPacketizer::RtpPacketizer(uint8_t payloadType, uint32_t clockRate,
                              uint32_t ssrc, uint16_t startSeqNum,
-                             size_t maxPacketSize)
+                             size_t maxPacketSize, bool enableTwcc)
     : payloadType_(payloadType), clockRate_(clockRate), ssrc_(ssrc),
-      sequenceNumber_(startSeqNum), maxPacketSize_(maxPacketSize) {}
+      sequenceNumber_(startSeqNum), maxPacketSize_(maxPacketSize),
+      enableTwcc_(enableTwcc),
+      twccSeq_(enableTwcc ? std::random_device{}() : 0) {}
 
 // ============================================================================
 // packetizeH264 - H.264 NAL 单元打包
@@ -82,6 +89,7 @@ std::vector<RtpPacket> RtpPacketizer::packetizeH264(
         pkt.setTimestamp(timestamp);
         pkt.setSsrc(ssrc_);
         pkt.setMarker(true);  // 单 NAL 模式下，该包就是帧的最后一个包，M=1
+        if (enableTwcc_) pkt.setTwccSeq(twccSeq_++);  // 传输层序号（GCC 用）
         pkt.setPayload(nalUnit);  // 整个 NAL 单元作为负载
         result.push_back(std::move(pkt));
         return result;
@@ -163,6 +171,7 @@ std::vector<RtpPacket> RtpPacketizer::packetizeH264(
         pkt.setTimestamp(timestamp);  // 同一帧的所有分片共享相同时间戳
         pkt.setSsrc(ssrc_);
         pkt.setMarker(isLast);  // 只有最后一个分片标记位 M=1
+        if (enableTwcc_) pkt.setTwccSeq(twccSeq_++);  // 传输层序号（GCC 用）
         pkt.setPayload(fuPayload);
         result.push_back(std::move(pkt));
 
@@ -198,6 +207,9 @@ std::vector<RtpPacket> RtpPacketizer::packetizeOpus(
     pkt.setTimestamp(timestamp);
     pkt.setSsrc(ssrc_);
     pkt.setMarker(true);  // Opus 帧不需要分片，M=1
+    // 音频流默认不启用 TWCC（构造时 enableTwcc=false）；
+    // 若显式启用也照常打点，逻辑保持通用
+    if (enableTwcc_) pkt.setTwccSeq(twccSeq_++);
     pkt.setPayload(opusFrame);
 
     std::vector<RtpPacket> result;

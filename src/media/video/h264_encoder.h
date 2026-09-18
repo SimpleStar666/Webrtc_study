@@ -123,6 +123,13 @@ public:
     // 幂等：重复调用在下一帧只产生一个 IDR
     void forceKeyframe();
 
+    // 运行时调整目标码率（工程化升级 v2 新增，GCC 输出的应用点）
+    // 直接改 codecCtx_->bit_rate；libx264 的码率控制（RC）会在后续帧
+    // 渐进收敛到新目标——不重置编码器（无黑帧、无重新协商），质量过渡
+    // 有短暂波动属正常。自动钳制 [100, 4000] kbps，与 GccController
+    // 的输出范围一致。init() 之前调用只更新配置（init 时生效）。
+    bool setBitrate(uint32_t kbps);
+
 private:
     // 处理编码输出的 AVPacket
     // 解析 AVCC 格式（4字节大端长度前缀 + NAL 数据），逐个提取 NAL 单元并触发回调

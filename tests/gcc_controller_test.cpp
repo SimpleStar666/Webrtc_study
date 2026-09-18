@@ -88,3 +88,28 @@ TEST(Gcc, ClampsToMaximum) {
     for (int i = 0; i < 30; ++i) gcc.onLossUpdate(0.0);
     EXPECT_EQ(gcc.targetBitrateKbps(), 4000u);
 }
+
+// 过载嫌疑期（斜率超阈值但 streak 未满 3 次去抖）：保持码率不增长
+// （嫌疑期继续加码只会把队列压得更满；正确行为是保持-观察）
+TEST(Gcc, HoldDuringOveruseSuspicion) {
+    crystal::GccController gcc(1000);
+    auto feedOveruse = [&](int base) {   // 20 样本/轮，OWD 持续增长
+        crystal::FeedbackSample s;
+        for (int i = 0; i < 20; ++i) {
+            double send = base * 10.0;
+            double owd = 100.0 + (base + i) * 0.5;
+            s.arrivals.push_back({static_cast<uint16_t>(base + i), send + owd});
+            s.owdMs.push_back(owd);
+        }
+        gcc.onFeedback(s);
+    };
+    feedOveruse(0);
+    gcc.tick();                            // streak 1：嫌疑期 → 保持
+    EXPECT_EQ(gcc.targetBitrateKbps(), 1000u);
+    feedOveruse(20);
+    gcc.tick();                            // streak 2：仍保持
+    EXPECT_EQ(gcc.targetBitrateKbps(), 1000u);
+    feedOveruse(40);
+    gcc.tick();                            // streak 3 → ×0.85 退避
+    EXPECT_NEAR(gcc.targetBitrateKbps(), 850u, 1);
+}

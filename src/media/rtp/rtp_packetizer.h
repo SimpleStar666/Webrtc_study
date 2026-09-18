@@ -75,6 +75,11 @@ namespace crystal {
 // 【与 RFC 规范的对应】
 // - H.264 打包: 遵循 RFC 6184 "RTP Payload Format for H.264 Video"
 // - Opus 打包:  遵循 RFC 7587 "RTP Payload Format for Opus Speech and Audio Codec"
+//
+// 【TWCC 扩展打点（工程化升级 v2 新增）】
+// enableTwcc=true 时每个生成的 RTP 包自动打上递增的传输层序号（GCC 带宽
+// 估计的数据源）。只对视频流启用——音频包小且 50 包/秒，反馈开销不划算
+// （生产 WebRTC 同样只做视频）。起始序号随机化，与 RTP 序列号同理。
 // ============================================================================
 class RtpPacketizer {
 public:
@@ -85,8 +90,10 @@ public:
     //   ssrc          - 同步源标识符，标识本端 RTP 数据流
     //   startSeqNum   - 初始序列号，默认为 0（实际应用中应随机初始化以防攻击）
     //   maxPacketSize - RTP 包最大负载大小（字节），默认 1200，确保不超过 MTU
+    //   enableTwcc    - 是否打 TWCC 传输层序号扩展头（视频 true / 音频 false）
     RtpPacketizer(uint8_t payloadType, uint32_t clockRate, uint32_t ssrc,
-                  uint16_t startSeqNum = 0, size_t maxPacketSize = 1200);
+                  uint16_t startSeqNum = 0, size_t maxPacketSize = 1200,
+                  bool enableTwcc = false);
 
     // 将 H.264 NAL 单元打包为 RTP 包序列
     // 参数:
@@ -136,6 +143,14 @@ private:
     // 默认 1200 字节，这是 WebRTC 中常用的安全值
     // 计算依据: MTU(1500) - IP头(20) - UDP头(8) = 1472，留余量取 1200
     size_t maxPacketSize_;
+
+    // 是否打 TWCC 传输层序号扩展头（工程化升级 v2 新增）
+    // 视频流 true（GCC 带宽估计数据源），音频流 false
+    bool enableTwcc_;
+
+    // TWCC 传输层序号（与 RTP 序列号独立，每生成一个包 +1）
+    // 构造时随机初始化（防猜测），回绕自然发生
+    uint16_t twccSeq_ = 0;
 };
 
 } // namespace crystal
