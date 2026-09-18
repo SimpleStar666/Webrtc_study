@@ -46,3 +46,31 @@ TEST(MetricsCollector, SendBitrateWindow) {
     m.onBytesSent(5100, 0);   // 0 字节打点，仅推进窗口右端
     EXPECT_NEAR(m.sendBitrateKbps(), 8.0, 0.01);
 }
+
+// E2E：SR 锚点 + RTP 时间差 + RTT/2，取 5s 窗口最小值
+TEST(MetricsCollector, E2eDelay) {
+    crystal::MetricsCollector m(90000, 30);   // 视频时钟 90kHz
+    m.setRttMs(100.0);                        // RTT 100ms → RTT/2 = 50ms
+    // 对端 SR 在发送侧 t=0 发出（RTP 锚点 ts=0），网络单向 50ms，本地 t=50 到达
+    m.onSenderReportMapping(0, 50);
+
+    // 包 A：发送侧 t=100 发出（RTP ts=9000，90kHz 下 9000/90=100ms），t=150 到达本地
+    //   e2e = (150 - 50) - 100 + 50 = 50ms ✓（= 真实单向延迟）
+    m.onPacketArrival(150, 9000);
+    ASSERT_TRUE(m.hasE2e());
+    EXPECT_NEAR(m.e2eDelayMs(), 50.0, 0.01);
+
+    // 包 B：网络抖动导致 80ms 单向才到（排队 30ms）
+    m.onPacketArrival(280, 18000);            // 发送侧 t=200，到达 t=280
+    EXPECT_NEAR(m.e2eDelayMs(), 50.0, 0.01);  // min 仍是 50（B 是 80）
+
+    // RTP 时间戳回绕：32 位回绕点 2^32-1 附近（音频 48kHz 流）
+    crystal::MetricsCollector m2(48000, 0);
+    m2.onSenderReportMapping(4294967295u, 1000);   // 锚点 = 2^32 - 1
+    m2.setRttMs(80.0);                             // RTT/2 = 40ms
+    // 音频 48kHz：锚点后 480 采样 = 10ms；包 ts = (2^32-1) + 480 mod 2^32 = 479
+    //   int32 差 = +480（回绕正确处理），e2e = (1050-1000) - 10 + 40 = 80ms
+    m2.onPacketArrival(1050, 479);
+    ASSERT_TRUE(m2.hasE2e());
+    EXPECT_NEAR(m2.e2eDelayMs(), 80.0, 0.01);
+}

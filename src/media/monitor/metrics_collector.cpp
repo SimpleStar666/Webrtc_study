@@ -30,16 +30,47 @@ void MetricsCollector::onRenderedFrame(uint64_t nowMs) {
 }
 
 // ----------------------------------------------------------------------------
-// onPacketArrival - E2E 采样（Task 3 实现）
+// onSenderReportMapping - 记录 SR 的 NTP↔RTP 锚点（E2E 计算基准）
 // ----------------------------------------------------------------------------
-void MetricsCollector::onPacketArrival(uint64_t /*nowMs*/, uint32_t /*rtpTs*/) {
+// SR 同时携带"同一个时刻的两种表示"：对端 NTP 时间戳 + RTP 时间戳。
+// 这一对就是钟表换算的锚点——有了它，任意 RTP 时间戳都能映射回
+// 对端时钟的发送时刻，E2E 公式的核心依赖。
+void MetricsCollector::onSenderReportMapping(uint32_t srRtpTs,
+                                             uint64_t srArrivalMs) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    hasSrAnchor_ = true;
+    srRtpTs_ = srRtpTs;
+    srArrivalMs_ = srArrivalMs;
 }
 
 // ----------------------------------------------------------------------------
-// onSenderReportMapping - SR 锚点记录（Task 3 实现）
+// onPacketArrival - E2E 采样（本项目 v2 最有面试价值的算法之一）
 // ----------------------------------------------------------------------------
-void MetricsCollector::onSenderReportMapping(uint32_t /*srRtpTs*/,
-                                             uint64_t /*srArrivalMs*/) {
+// 【问题】两台机器时钟不同步："对端 10:00 发、我 10:03 收"没有意义。
+//
+// 【E2E 公式】
+//   e2e = (包到达本地时刻 − SR到达本地时刻) − RTP时间差(ms) + RTT/2
+//
+// 【推导】设两端时钟偏移 offset、对称路径：
+//   包到达 = 发送时刻(srNtp + rtpDelta) + offset + 单向延迟
+//   SR到达 = srNtp + offset + RTT/2
+//   两式相减，offset 被消掉（关键！），得到上式。
+//   数值自检：RTT=100ms、双向各 50ms，SR t=0 发 t=50 到，
+//   包 t=100 发 t=150 到 → (150-50) - 100 + 50 = 50ms ✓
+//
+// 【RTP 时间差的回绕】uint32 减法转 int32：活跃流的 |差| 恒 < 2^31，
+// 补码解释天然正确（与 JitterBuffer 的 16 位 seq 技巧同宗）。
+void MetricsCollector::onPacketArrival(uint64_t nowMs, uint32_t rtpTs) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    // 没有 SR 锚点或 RTT 时算不了（开局前几秒的正常状态）
+    if (!hasSrAnchor_ || !hasRtt_) return;
+    // RTP 时间差转毫秒：clockRate_ 视频 90000 / 音频 48000
+    int32_t d = static_cast<int32_t>(rtpTs - srRtpTs_);
+    double rtpDeltaMs = static_cast<double>(d) * 1000.0 / clockRate_;
+    double e2e = static_cast<double>(nowMs - srArrivalMs_) - rtpDeltaMs
+                + rttMs_ / 2.0;
+    e2eSamplesMs_.emplace_back(nowMs, e2e);
+    evictWindowsLocked(nowMs);
 }
 
 // ----------------------------------------------------------------------------
@@ -85,7 +116,17 @@ bool MetricsCollector::hasE2e() const {
     return hasSrAnchor_ && hasRtt_ && !e2eSamplesMs_.empty();
 }
 
-double MetricsCollector::e2eDelayMs() const { return 0.0; }  // Task 3 实现
+// e2eDelayMs - 最近 5s 窗口内 E2E 的最小值
+// 【为什么取 min 而不是均值】排队抖动只会让样本变大不会变小，
+// min 滤掉抖动后得到接近"路径本底"的 E2E；均值会被突发抖动拉高。
+// （工程上常同时上报 min/p95，本实现保最小闭环，指南里说明差异。）
+double MetricsCollector::e2eDelayMs() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (e2eSamplesMs_.empty()) return 0.0;
+    double best = e2eSamplesMs_.front().second;
+    for (const auto& [ts, v] : e2eSamplesMs_) best = std::min(best, v);
+    return best;
+}
 
 // sendBitrateKbps - 最近 5s 发送码率：窗口字节 × 8 / 5000ms
 // 【窗口右端的取法】用最新打点时刻而非"当前真实时刻"——查询接口不读
