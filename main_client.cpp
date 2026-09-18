@@ -168,6 +168,11 @@ int main(int argc, char* argv[]) {
     crystal::JitterBuffer videoJitterBuf(40);
     // 音频抖动缓冲区
     crystal::JitterBuffer audioJitterBuf(40);
+    // 音频播放序号记忆（工程化升级 v2 新增，FEC 跳变检测用）：
+    // consume 输出的包序号出现跳变 = 中间有帧丢失 → 触发 decodeFec 恢复。
+    // 放在 audioJitterBuf 旁边是因为它俩同属"接收链路状态"
+    bool hasLastAudioSeq = false;
+    uint16_t lastAudioSeq = 0;
 
     // ---- 步骤3b：RTCP 反馈组件 ----
     // 发送侧：已发视频包缓存，响应对端 NACK 补发（音频不做 NACK——
@@ -286,13 +291,31 @@ int main(int argc, char* argv[]) {
                 }
             }
         } else if (pkt.payloadType() == 97) {
-            // 音频只做统计（不做 NACK：重传到达已错过播放时刻，
-            // Opus 自带 PLC 丢包隐藏更划算）
+            // 音频不做 NACK（重传到达已错过播放时刻），
+            // 抗丢包走 FEC+PLC 两层防线（工程化升级 v2 完成闭环）
             audioRecvReport.onPacketReceived(pkt.ssrc(), pkt.sequenceNumber(),
                                              pkt.timestamp(), crystal::nowNtp());
             audioMetrics.onPacketArrival(nowMs(), pkt.timestamp());  // E2E（v2）
+            // 【bug 修复】此前音频分支只 consume 不 insert——包从未真正
+            // 进入 JitterBuffer，远端音频从未被解码播放。insert 是包进入
+            // 缓冲区的唯一入口，consume 只负责按序取出
+            audioJitterBuf.insert(pkt);
             auto packets = audioJitterBuf.consume();       // 获取有序的 RTP 包
             for (const auto& p : packets) {
+                // ---- FEC 恢复：播放序号跳变 = 上一帧丢失（工程化升级 v2）----
+                // 收到 B 时发现 A(seq-1) 没到 → decodeFec(B) 从 B 中提取
+                // A 的内嵌冗余副本，恢复出 A 先播放（int16_t 差值比较
+                // 天然处理 seq 回绕）；decodeFec 返回空则由 opusDecoder
+                // 内部的 PLC 机制兜底
+                if (hasLastAudioSeq &&
+                    static_cast<int16_t>(p.sequenceNumber() - lastAudioSeq) != 1) {
+                    auto recovered = opusDecoder.decodeFec(
+                        p.payload().data(), p.payload().size());
+                    if (!recovered.empty()) {
+                        audioPlayer.play(recovered.data(), recovered.size());
+                    }
+                }
+                // ---- 正常解码播放当前帧 ----
                 auto frames = depacketizer.depacketizeOpus(p);  // RTP 解包为 Opus 帧
                 for (const auto& frame : frames) {
                     auto pcm = opusDecoder.decode(frame.data(), frame.size());  // Opus 解码为 PCM
@@ -300,6 +323,8 @@ int main(int argc, char* argv[]) {
                         audioPlayer.play(pcm.data(), pcm.size());  // 播放 PCM 音频
                     }
                 }
+                hasLastAudioSeq = true;
+                lastAudioSeq = p.sequenceNumber();
             }
         }
     });
@@ -595,6 +620,14 @@ int main(int argc, char* argv[]) {
                                   videoMetrics.summaryLine());
             crystal::Logger::info("[metrics][a] {}",
                                   audioMetrics.summaryLine());
+
+            // --- 闭环：RR 实测丢包率 → 动态调 FEC 冗余度（工程化升级 v2）---
+            // 对端 RR 报告块里我方音频流的 fraction lost，含义是
+            // "我方音频流在对端眼里"的丢包率（8 位定点，255=100%）。
+            // 换算成百分比喂给编码器，libopus 据此决定 FEC 冗余量：
+            // 丢包率 2% 编 30% 冗余是浪费，丢包率 30% 编 2% 冗余等于没编
+            opusEncoder.setPacketLossPct(
+                audioSendReport.remoteFractionLost() * 100 / 255);
         }
 
         std::this_thread::sleep_for(std::chrono::milliseconds(16));  // ~60fps 轮询
