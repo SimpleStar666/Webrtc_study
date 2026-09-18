@@ -77,3 +77,10 @@ add_library(crystal_room STATIC
 )
 target_include_directories(crystal_room PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(crystal_room PUBLIC crystal_utils nlohmann_json::nlohmann_json)
+
+# --- Media: Monitor（工程化升级 v2：可观测性）---
+add_library(crystal_media_monitor STATIC
+    media/monitor/metrics_collector.cpp
+)
+target_include_directories(crystal_media_monitor PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(crystal_media_monitor PUBLIC crystal_utils)

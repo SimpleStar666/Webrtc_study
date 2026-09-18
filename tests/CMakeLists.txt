@@ -20,3 +20,11 @@ target_link_libraries(crystal_rtcp_tests PRIVATE
     crystal_media_rtcp crystal_media_rtp crystal_utils GTest::gtest_main
 )
 add_test(NAME crystal_rtcp_tests COMMAND crystal_rtcp_tests)
+
+add_executable(crystal_metrics_tests
+    metrics_collector_test.cpp
+)
+target_link_libraries(crystal_metrics_tests PRIVATE
+    crystal_media_monitor crystal_utils GTest::gtest_main
+)
+add_test(NAME crystal_metrics_tests COMMAND crystal_metrics_tests)
