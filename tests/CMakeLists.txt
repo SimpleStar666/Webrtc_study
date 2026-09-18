@@ -43,6 +43,7 @@ add_test(NAME crystal_opus_tests COMMAND crystal_opus_tests)
 # GCC 带宽估计测试（工程化升级 v2 新增）
 add_executable(crystal_gcc_tests
     trendline_test.cpp
+    gcc_controller_test.cpp
 )
 target_link_libraries(crystal_gcc_tests PRIVATE
     crystal_media_gcc crystal_utils GTest::gtest_main
