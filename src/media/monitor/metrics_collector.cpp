@@ -4,6 +4,7 @@
 
 #include "media/monitor/metrics_collector.h"
 #include <algorithm>
+#include <cstdio>
 
 namespace crystal {
 
@@ -144,9 +145,25 @@ double MetricsCollector::sendBitrateKbps() const {
     return static_cast<double>(total) * 8.0 / 5000.0;
 }
 
+// summaryLine - 拼接可读指标行
+// 【格式设计】视频流 = "渲染 X.Xfps | 卡顿 N | E2E Xms | 发送 Xkbps"
+//              音频流 = "E2E Xms | 发送 Xkbps"（expectedFps_==0 跳过帧率段）
+// 【缺失值显示 "-" 而不是 0】0 会被误读为"延迟为零"，"-" 明确表示
+// "尚未就绪"（例如通话刚开始 RTT 还没算出来）——可观测性指标的
+// 基本素养：宁缺勿假。
 std::string MetricsCollector::summaryLine() const {
-    // Task 4 实现（拼 [metrics] 行）
-    return "";
+    char buf[160];
+    std::string head;
+    if (expectedFps_ > 0) {
+        snprintf(buf, sizeof(buf), "渲染 %.1ffps | 卡顿 %lu | ",
+                 renderFps(), static_cast<unsigned long>(stallCount()));
+        head = buf;
+    }
+    std::string e2e = hasE2e() ? std::to_string(
+                          static_cast<int>(e2eDelayMs())) + "ms" : "-";
+    snprintf(buf, sizeof(buf), "E2E %s | 发送 %.0fkbps",
+             e2e.c_str(), sendBitrateKbps());
+    return head + buf;
 }
 
 // ----------------------------------------------------------------------------

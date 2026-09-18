@@ -74,3 +74,18 @@ TEST(MetricsCollector, E2eDelay) {
     ASSERT_TRUE(m2.hasE2e());
     EXPECT_NEAR(m2.e2eDelayMs(), 80.0, 0.01);
 }
+
+// 拼接行：视频流含 fps/卡顿段，音频流不含
+TEST(MetricsCollector, SummaryLine) {
+    crystal::MetricsCollector video(90000, 30);
+    video.onRenderedFrame(0);
+    video.onBytesSent(0, 1000);
+    std::string s = video.summaryLine();
+    EXPECT_NE(s.find("fps"), std::string::npos);
+    EXPECT_NE(s.find("卡顿"), std::string::npos);
+
+    crystal::MetricsCollector audio(48000, 0);
+    std::string a = audio.summaryLine();
+    // 音频流不该出现帧率段
+    EXPECT_EQ(a.find("fps"), std::string::npos);
+}
