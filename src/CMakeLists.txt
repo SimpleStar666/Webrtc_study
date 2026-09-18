@@ -94,3 +94,11 @@ add_library(crystal_media_gcc STATIC
 )
 target_include_directories(crystal_media_gcc PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(crystal_media_gcc PUBLIC crystal_utils)
+
+# --- Media: Adaptive（工程化升级 v2/Phase E：网络自适应）---
+add_library(crystal_media_adaptive STATIC
+    media/adaptive/network_quality_classifier.cpp
+    media/adaptive/adaptation_controller.cpp
+)
+target_include_directories(crystal_media_adaptive PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(crystal_media_adaptive PUBLIC crystal_utils)

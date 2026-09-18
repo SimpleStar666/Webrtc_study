@@ -59,3 +59,13 @@ target_link_libraries(crystal_gcc_tests PRIVATE
     crystal_media_gcc crystal_utils GTest::gtest_main
 )
 add_test(NAME crystal_gcc_tests COMMAND crystal_gcc_tests)
+
+# 网络自适应测试（工程化升级 v2 Phase E 新增）
+add_executable(crystal_adaptive_tests
+    network_classifier_test.cpp
+    framerate_throttler_test.cpp
+)
+target_link_libraries(crystal_adaptive_tests PRIVATE
+    crystal_media_adaptive crystal_utils GTest::gtest_main
+)
+add_test(NAME crystal_adaptive_tests COMMAND crystal_adaptive_tests)
